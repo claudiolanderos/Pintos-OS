@@ -523,6 +523,18 @@ idle (void *idle_started_ UNUSED)
       intr_disable ();
       thread_block ();
 
+      /* Re-enable interrupts and wait for the next one.
+
+         The `sti' instruction disables interrupts until the
+         completion of the next instruction, so these two
+         instructions are executed atomically.  This atomicity is
+         important; otherwise, an interrupt could be handled
+         between re-enabling interrupts and waiting for the next
+         one to occur, wasting as much as one clock tick worth of
+         time.
+
+         See [IA32-v2a] "HLT", [IA32-v2b] "STI", and [IA32-v3a]
+         7.11.1 "HLT Instruction". */
       asm volatile ("sti; hlt" : : : "memory");
     }
 }

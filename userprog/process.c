@@ -38,6 +38,10 @@ static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static void push_arguments (const char *[], int cnt, void **esp);
 
+/* Starts a new thread running a user program loaded from
+   `cmdline`. The new thread may be scheduled (and may even exit)
+   before process_execute() returns.  Returns the new process's
+   thread id, or TID_ERROR if the thread cannot be created. */
 pid_t
 process_execute (const char *cmdline)
 {
@@ -46,6 +50,8 @@ process_execute (const char *cmdline)
   struct process_control_block *pcb = NULL;
   tid_t tid;
 
+  /* Make a copy of CMD_LINE.
+     Otherwise there's a race between the caller and load(). */
   cmdline_copy = palloc_get_page (0);
   if (cmdline_copy == NULL) {
     goto execute_failed;
@@ -156,6 +162,9 @@ start_process (void *pcb_)
 
 finish_step:
 
+  /* Assign PCB */
+  // we maintain an one-to-one mapping between pid and tid, with identity function.
+  // pid is determined, so interact with process_execute() for maintaining child_list
   pcb->pid = success ? (pid_t)(t->tid) : PID_ERROR;
   t->pcb = pcb;
 
@@ -315,6 +324,13 @@ process_exit (void)
   pd = cur->pagedir;
   if (pd != NULL)
     {
+      /* Correct ordering here is crucial.  We must set
+         cur->pagedir to NULL before switching page directories,
+         so that a timer interrupt can't switch back to the
+         process page directory.  We must activate the base page
+         directory before destroying the process's page
+         directory, or our active page directory will be one
+         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
@@ -579,6 +595,20 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
   return true;
 }
 
+/* Loads a segment starting at offset OFS in FILE at address
+   UPAGE.  In total, READ_BYTES + ZERO_BYTES bytes of virtual
+   memory are initialized, as follows:
+
+        - READ_BYTES bytes at UPAGE must be read from FILE
+          starting at offset OFS.
+
+        - ZERO_BYTES bytes at UPAGE + READ_BYTES must be zeroed.
+
+   The pages initialized by this function must be writable by the
+   user process if WRITABLE is true, read-only otherwise.
+
+   Return true if successful, false if a memory allocation error
+   or disk read error occurs. */
 static bool
 load_segment (struct file *file, off_t ofs, uint8_t *upage,
               uint32_t read_bytes, uint32_t zero_bytes, bool writable)

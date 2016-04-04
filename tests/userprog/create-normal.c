@@ -6,6 +6,5 @@
 void
 test_main (void) 
 {
-  //just for recompile
   CHECK (create ("quux.dat", 0), "create quux.dat");
 }

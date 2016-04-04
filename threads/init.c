@@ -31,6 +31,10 @@
 #else
 #include "tests/threads/tests.h"
 #endif
+#ifdef VM
+#include "vm/frame.h"
+#include "vm/swap.h"
+#endif
 #ifdef FILESYS
 #include "devices/block.h"
 #include "devices/ide.h"
@@ -78,7 +82,7 @@ main (void)
 {
   char **argv;
 
-  /* Clear BSS. */  
+  /* Clear BSS. */
   bss_init ();
 
   /* Break command line into arguments and parse options. */
@@ -88,7 +92,7 @@ main (void)
   /* Initialize ourselves as a thread so we can use locks,
      then enable console locking. */
   thread_init ();
-  console_init ();  
+  console_init ();
 
   /* Greet user. */
   printf ("Pintos booting with %'"PRIu32" kB RAM...\n",
@@ -98,6 +102,11 @@ main (void)
   palloc_init (user_page_limit);
   malloc_init ();
   paging_init ();
+
+#ifdef VM
+  /* Initialize Virtual memory system. (Project 3) */
+  vm_frame_init();
+#endif
 
   /* Segmentation. */
 #ifdef USERPROG
@@ -126,9 +135,12 @@ main (void)
   locate_block_devices ();
   filesys_init (format_filesys);
 #endif
+#ifdef VM
+  vm_swap_init ();
+#endif
 
   printf ("Boot complete.\n");
-  
+
   /* Run actions specified on kernel command line. */
   run_actions (argv);
 
@@ -144,11 +156,10 @@ main (void)
    The start and end of the BSS segment is recorded by the
    linker as _start_bss and _end_bss.  See kernel.lds. */
 static void
-bss_init (void) 
+bss_init (void)
 {
   extern char _start_bss, _end_bss;
   memset (&_start_bss, 0, &_end_bss - &_start_bss);
-  printf("bss_init() &_start_bss:%x,&_end_bss:%x,length:%d\n",&_start_bss,&_end_bss,&_end_bss-&_start_bss);
 }
 
 /* Populates the base page directory and page table with the
@@ -161,8 +172,6 @@ paging_init (void)
   uint32_t *pd, *pt;
   size_t page;
   extern char _start, _end_kernel_text;
-
-  uint32_t count_of_palloc=0;
 
   pd = init_page_dir = palloc_get_page (PAL_ASSERT | PAL_ZERO);
   pt = NULL;
@@ -178,16 +187,10 @@ paging_init (void)
         {
           pt = palloc_get_page (PAL_ASSERT | PAL_ZERO);
           pd[pde_idx] = pde_create (pt);
-		  count_of_palloc++;
-		  printf("pde_idx:%d\n",pde_idx);
         }
 
       pt[pte_idx] = pte_create_kernel (vaddr, !in_kernel_text);
     }
-  printf("paging_init() init_ram_pages:%d\n",init_ram_pages);
-  printf("paging_init() &_start:%x &_end_kernel_text:%x\n",&_start,&_end_kernel_text);
-  printf("count_of_palloc:%d\n",count_of_palloc);
-  printf("pd:%x pt:%x\n",pd,pt);
 
   /* Store the physical address of the page directory into CR3
      aka PDBR (page directory base register).  This activates our
@@ -200,7 +203,7 @@ paging_init (void)
 /* Breaks the kernel command line into words and returns them as
    an argv-like array. */
 static char **
-read_command_line (void) 
+read_command_line (void)
 {
   static char *argv[LOADER_ARGS_LEN / 2 + 1];
   char *p, *end;
@@ -210,7 +213,7 @@ read_command_line (void)
   argc = *(uint32_t *) ptov (LOADER_ARG_CNT);
   p = ptov (LOADER_ARGS);
   end = p + LOADER_ARGS_LEN;
-  for (i = 0; i < argc; i++) 
+  for (i = 0; i < argc; i++)
     {
       if (p >= end)
         PANIC ("command line arguments overflow");
@@ -235,14 +238,14 @@ read_command_line (void)
 /* Parses options in ARGV[]
    and returns the first non-option argument. */
 static char **
-parse_options (char **argv) 
+parse_options (char **argv)
 {
   for (; *argv != NULL && **argv == '-'; argv++)
     {
       char *save_ptr;
       char *name = strtok_r (*argv, "=", &save_ptr);
       char *value = strtok_r (NULL, "", &save_ptr);
-      
+
       if (!strcmp (name, "-h"))
         usage ();
       else if (!strcmp (name, "-q"))
@@ -282,7 +285,7 @@ parse_options (char **argv)
      for reproducibility.  To fix this, give the "-r" option to
      the pintos script to request real-time execution. */
   random_init (rtc_get_time ());
-  
+
   return argv;
 }
 
@@ -291,10 +294,9 @@ static void
 run_task (char **argv)
 {
   const char *task = argv[1];
-  
+
   printf ("Executing '%s':\n", task);
 #ifdef USERPROG
-  //printf("run_task() will call process_wait()\n");
   process_wait (process_execute (task));
 #else
   run_test (task);
@@ -305,10 +307,10 @@ run_task (char **argv)
 /* Executes all of the actions specified in ARGV[]
    up to the null pointer sentinel. */
 static void
-run_actions (char **argv) 
+run_actions (char **argv)
 {
   /* An action. */
-  struct action 
+  struct action
     {
       char *name;                       /* Action name. */
       int argc;                         /* # of args, including action name. */
@@ -316,7 +318,7 @@ run_actions (char **argv)
     };
 
   /* Table of supported actions. */
-  static const struct action actions[] = 
+  static const struct action actions[] =
     {
       {"run", 2, run_task},
 #ifdef FILESYS
@@ -334,7 +336,6 @@ run_actions (char **argv)
       const struct action *a;
       int i;
 
-	  printf("run_actions() *argv:%s\n",*argv);
       /* Find action name. */
       for (a = actions; ; a++)
         if (a->name == NULL)
@@ -351,7 +352,7 @@ run_actions (char **argv)
       a->function (argv);
       argv += a->argc;
     }
-  
+
 }
 
 /* Prints a kernel command line help message and powers off the
@@ -406,7 +407,6 @@ locate_block_devices (void)
   locate_block_device (BLOCK_SCRATCH, scratch_bdev_name);
 #ifdef VM
   locate_block_device (BLOCK_SWAP, swap_bdev_name);
-  swap_init();
 #endif
 }
 

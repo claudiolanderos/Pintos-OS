@@ -1,25 +1,32 @@
 #ifndef VM_SWAP_H
 #define VM_SWAP_H
 
-#include "devices/block.h"
-#include "threads/synch.h"
-#include "threads/vaddr.h"
-#include <bitmap.h>
+typedef uint32_t swap_index_t;
 
-#define SWAP_FREE 0
-#define SWAP_IN_USE 1
 
-#define SECTORS_PER_PAGE (PGSIZE / BLOCK_SECTOR_SIZE)
+/* Functions for Swap Table manipulation. */
 
-struct lock swap_lock;
+/**
+ * Initialize the swap. Must be called ONLY ONCE at the initializtion phase.
+ */
+void vm_swap_init (void);
 
-struct block *swap_block;
+/**
+ * Swap Out: write the content of `page` into the swap disk,
+ * and return the index of swap region in which it is placed.
+ */
+swap_index_t vm_swap_out (void *page);
 
-struct bitmap *swap_map;
+/**
+ * Swap In: read the content of from the specified swap index,
+ * from the mapped swap block, and store PGSIZE bytes into `page`.
+ */
+void vm_swap_in (swap_index_t swap_index, void *page);
 
-void swap_init (void);
-size_t swap_out (void *frame);
-void swap_in (size_t used_index, void* frame);
+/**
+ * Free Swap: drop the swap region.
+ */
+void vm_swap_free (swap_index_t swap_index);
+
 
 #endif /* vm/swap.h */
-

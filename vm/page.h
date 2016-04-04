@@ -1,51 +1,77 @@
 #ifndef VM_PAGE_H
 #define VM_PAGE_H
 
+#include "vm/swap.h"
 #include <hash.h>
-#include "vm/frame.h"
+#include "filesys/off_t.h"
 
-#define FILE 0
-#define SWAP 1
-#define MMAP 2
-#define HASH_ERROR 3
-
-// 256 KB
-#define MAX_STACK_SIZE (1 << 23)
-
-struct sup_page_entry {
-	uint8_t type;
-	void *uva;
-	bool writable;
-
-	bool is_loaded;
-	bool pinned;
-
-	// For files
-	struct file *file;
-	size_t offset;
-	size_t read_bytes;
-	size_t zero_bytes;
-
-	// For swap
-	size_t swap_index;
-
-	struct hash_elem elem;
+/**
+ * Indicates a state of page.
+ */
+enum page_status {
+  ALL_ZERO,         // All zeros
+  ON_FRAME,         // Actively in memory
+  ON_SWAP,          // Swapped (on swap slot)
+  FROM_FILESYS      // from filesystem (or executable)
 };
 
-void page_table_init (struct hash *spt);
-void page_table_destroy (struct hash *spt);
+/**
+ * Supplemental page table. The scope is per-process.
+ */
+struct supplemental_page_table
+  {
+    /* The hash table, page -> spte */
+    struct hash page_map;
+  };
 
-bool load_page (struct sup_page_entry *spte);
-bool load_mmap (struct sup_page_entry *spte);
-bool load_swap (struct sup_page_entry *spte);
-bool load_file (struct sup_page_entry *spte);
-bool add_file_to_page_table (struct file *file, int32_t ofs, uint8_t *upage,
-		uint32_t read_bytes, uint32_t zero_bytes,
-		bool writable);
-bool add_mmap_to_page_table(struct file *file, int32_t ofs, uint8_t *upage,
-		uint32_t read_bytes, uint32_t zero_bytes);
-bool grow_stack (void *uva);
-struct sup_page_entry* get_spte (void *uva);
+struct supplemental_page_table_entry
+  {
+    void *upage;              /* Virtual address of the page (the key) */
+    void *kpage;              /* Kernel page (frame) associated to it.
+                                 Only effective when status == ON_FRAME.
+                                 If the page is not on the frame, should be NULL. */
+    struct hash_elem elem;
 
-#endif /* vm/page.h */
+    enum page_status status;
 
+    bool dirty;               /* Dirty bit. */
+
+    // for ON_SWAP
+    swap_index_t swap_index;  /* Stores the swap index if the page is swapped out.
+                                 Only effective when status == ON_SWAP */
+
+    // for FROM_FILESYS
+    struct file *file;
+    off_t file_offset;
+    uint32_t read_bytes, zero_bytes;
+    bool writable;
+  };
+
+
+/*
+ * Methods for manipulating supplemental page tables.
+ */
+
+struct supplemental_page_table* vm_supt_create (void);
+void vm_supt_destroy (struct supplemental_page_table *);
+
+bool vm_supt_install_frame (struct supplemental_page_table *supt, void *upage, void *kpage);
+bool vm_supt_install_zeropage (struct supplemental_page_table *supt, void *);
+bool vm_supt_set_swap (struct supplemental_page_table *supt, void *, swap_index_t);
+bool vm_supt_install_filesys (struct supplemental_page_table *supt, void *page,
+    struct file * file, off_t offset, uint32_t read_bytes, uint32_t zero_bytes, bool writable);
+
+struct supplemental_page_table_entry* vm_supt_lookup (struct supplemental_page_table *supt, void *);
+bool vm_supt_has_entry (struct supplemental_page_table *, void *page);
+
+bool vm_supt_set_dirty (struct supplemental_page_table *supt, void *, bool);
+
+bool vm_load_page(struct supplemental_page_table *supt, uint32_t *pagedir, void *upage);
+
+bool vm_supt_mm_unmap(struct supplemental_page_table *supt, uint32_t *pagedir,
+    void *page, struct file *f, off_t offset, size_t bytes);
+
+void vm_pin_page(struct supplemental_page_table *supt, void *page);
+void vm_unpin_page(struct supplemental_page_table *supt, void *page);
+
+#endif

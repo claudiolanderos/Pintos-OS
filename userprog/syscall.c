@@ -276,7 +276,6 @@ syscall_handler (struct intr_frame *f)
 
 }
 
-/****************** System Call Implementations ********************/
 
 void sys_halt(void) {
   shutdown_power_off();
@@ -303,8 +302,6 @@ void sys_exit(int status) {
 pid_t sys_exec(const char *cmdline) {
   _DEBUG_PRINTF ("[DEBUG] Exec : %s\n", cmdline);
 
-  // cmdline is an address to the character buffer, on user memory
-  // so a validation check is required
   check_user((const uint8_t*) cmdline);
 
   lock_acquire (&filesys_lock); // load() uses filesystem
@@ -607,7 +604,6 @@ bool sys_munmap(mmapid_t mid)
 
 #endif
 
-/****************** Helper Functions on Memory Access ********************/
 
 static void
 check_user (const uint8_t *uaddr) {
@@ -637,11 +633,6 @@ get_user (const uint8_t *uaddr) {
   return result;
 }
 
-/* Writes a single byte (content is 'byte') to user address 'udst'.
- * 'udst' must be below PHYS_BASE.
- *
- * Returns true if successful, false if a segfault occurred.
- */
 static bool
 put_user (uint8_t *udst, uint8_t byte) {
   // check that a user pointer `udst` points below PHYS_BASE
@@ -651,21 +642,12 @@ put_user (uint8_t *udst, uint8_t byte) {
 
   int error_code;
 
-  // as suggested in the reference manual, see (3.1.5)
   asm ("movl $1f, %0; movb %b2, %1; 1:"
       : "=&a" (error_code), "=m" (*udst) : "q" (byte));
   return error_code != -1;
 }
 
 
-/**
- * Reads a consecutive `bytes` bytes of user memory with the
- * starting address `src` (uaddr), and writes to dst.
- *
- * Returns the number of bytes read.
- * In case of invalid memory access, exit() is called and consequently
- * the process is terminated with return code -1.
- */
 static int
 memread_user (void *src, void *dst, size_t bytes)
 {
@@ -681,8 +663,6 @@ memread_user (void *src, void *dst, size_t bytes)
   return (int)bytes;
 }
 
-
-/****************** Helper Functions ********************/
 
 static struct file_desc*
 find_file_desc(struct thread *t, int fd)

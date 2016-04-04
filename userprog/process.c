@@ -302,20 +302,11 @@ process_exit (void)
     file_close(cur->executing_file);
   }
 
-  /* Unblock the waiting parent process, if any, from wait().
-     now its resource (pcb on page, etc.) can be freed. */
-  /* IMPORTANT : The order of setting pcb->exited as true does matter.
-     To guarantee that the process and pcb is not used any more when freeing it
-     (i.e. in wait() procedure -- see near L250),
-     we have to run this assignment as late as possible
-     (just before a switch context might happen). */
+
   cur->pcb->exited = true;
   bool cur_orphan = cur->pcb->orphan;
   sema_up (&cur->pcb->sema_wait);
 
-  // In this context, cur->pcb is supposed to be freed (so don't access it)
-  // Destroy the pcb object by itself, if it is orphan (which is stored before)
-  // see (part 2) of above.
   if (cur_orphan) {
     palloc_free_page (& cur->pcb);
   }
@@ -323,7 +314,6 @@ process_exit (void)
 #ifdef VM
   // Destroy the SUPT, its all SPTEs, all the frames, and swaps.
   // Important: All the frames held by this thread should ALSO be freed
-  // (see the destructor of SPTE). Otherwise an access to frame with
   // its owner thread had been died will result in fault.
   vm_supt_destroy (cur->supt);
   cur->supt = NULL;

@@ -21,6 +21,7 @@ threads_SRC += threads/intr-stubs.S	# Interrupt stubs.
 threads_SRC += threads/synch.c		# Synchronization.
 threads_SRC += threads/palloc.c		# Page allocator.
 threads_SRC += threads/malloc.c		# Subpage allocator.
+threads_SRC += threads/sched.c
 
 # Device driver code.
 devices_SRC  = devices/pit.c		# Programmable interrupt timer chip.
@@ -60,11 +61,16 @@ userprog_SRC += userprog/exception.c	# User exception handler.
 userprog_SRC += userprog/syscall.c	# System call handler.
 userprog_SRC += userprog/gdt.c		# GDT initialization.
 userprog_SRC += userprog/tss.c		# TSS management.
+userprog_SRC += userprog/args_passing.c
+userprog_SRC += userprog/miscellaneous.c
 
 # No virtual memory code yet.
-vm_SRC = vm/frame_table.c	
-vm_SRC += vm/page_table.c
-vm_SRC += vm/swap_table.c
+#vm_SRC = vm/file.c			# Some file.
+
+# Virtual Memory code.
+vm_SRC  = vm/frame.c
+vm_SRC += vm/page.c
+vm_SRC += vm/swap.c
 
 # Filesystem code.
 filesys_SRC  = filesys/filesys.c	# Filesystem core.

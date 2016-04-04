@@ -33,20 +33,20 @@ static int memread_user (void *src, void *des, size_t bytes);
 
 static struct file_desc* find_file_desc(struct thread *, int fd);
 
-void sys_halt (void);
-void sys_exit (int);
-pid_t sys_exec (const char *cmdline);
-int sys_wait (pid_t pid);
+void halt (void);
+void exit (int);
+pid_t exec (const char *cmdline);
+int wait (pid_t pid);
 
-bool sys_create(const char* filename, unsigned initial_size);
-bool sys_remove(const char* filename);
+bool create(const char* filename, unsigned initial_size);
+bool remove(const char* filename);
 int sys_open(const char* file);
 int sys_filesize(int fd);
-void sys_seek(int fd, unsigned position);
-unsigned sys_tell(int fd);
-void sys_close(int fd);
-int sys_read(int fd, void *buffer, unsigned size);
-int sys_write(int fd, const void *buffer, unsigned size);
+void seek(int fd, unsigned position);
+unsigned tell(int fd);
+void close(int fd);
+int read(int fd, void *buffer, unsigned size);
+int write(int fd, const void *buffer, unsigned size);
 
 #ifdef VM
 mmapid_t sys_mmap(int fd, void *);
@@ -72,7 +72,7 @@ static void fail_invalid_access(void) {
   if (lock_held_by_current_thread(&filesys_lock))
     lock_release (&filesys_lock);
 
-  sys_exit (-1);
+  exit (-1);
   NOT_REACHED();
 }
 
@@ -95,7 +95,7 @@ syscall_handler (struct intr_frame *f)
   switch (syscall_number) {
   case SYS_HALT: // 0
     {
-      sys_halt();
+      halt();
       NOT_REACHED();
       break;
     }
@@ -105,7 +105,7 @@ syscall_handler (struct intr_frame *f)
       int exitcode;
       memread_user(f->esp + 4, &exitcode, sizeof(exitcode));
 
-      sys_exit(exitcode);
+      exit(exitcode);
       NOT_REACHED();
       break;
     }
@@ -115,7 +115,7 @@ syscall_handler (struct intr_frame *f)
       void* cmdline;
       memread_user(f->esp + 4, &cmdline, sizeof(cmdline));
 
-      int return_code = sys_exec((const char*) cmdline);
+      int return_code = exec((const char*) cmdline);
       f->eax = (uint32_t) return_code;
       break;
     }
@@ -125,7 +125,7 @@ syscall_handler (struct intr_frame *f)
       pid_t pid;
       memread_user(f->esp + 4, &pid, sizeof(pid_t));
 
-      int ret = sys_wait(pid);
+      int ret = wait(pid);
       f->eax = (uint32_t) ret;
       break;
     }
@@ -139,7 +139,7 @@ syscall_handler (struct intr_frame *f)
       memread_user(f->esp + 4, &filename, sizeof(filename));
       memread_user(f->esp + 8, &initial_size, sizeof(initial_size));
 
-      return_code = sys_create(filename, initial_size);
+      return_code = create(filename, initial_size);
       f->eax = return_code;
       break;
     }
@@ -151,7 +151,7 @@ syscall_handler (struct intr_frame *f)
 
       memread_user(f->esp + 4, &filename, sizeof(filename));
 
-      return_code = sys_remove(filename);
+      return_code = remove(filename);
       f->eax = return_code;
       break;
     }
@@ -188,7 +188,7 @@ syscall_handler (struct intr_frame *f)
       memread_user(f->esp + 8, &buffer, sizeof(buffer));
       memread_user(f->esp + 12, &size, sizeof(size));
 
-      return_code = sys_read(fd, buffer, size);
+      return_code = read(fd, buffer, size);
       f->eax = (uint32_t) return_code;
       break;
     }
@@ -203,7 +203,7 @@ syscall_handler (struct intr_frame *f)
       memread_user(f->esp + 8, &buffer, sizeof(buffer));
       memread_user(f->esp + 12, &size, sizeof(size));
 
-      return_code = sys_write(fd, buffer, size);
+      return_code = write(fd, buffer, size);
       f->eax = (uint32_t) return_code;
       break;
     }
@@ -216,7 +216,7 @@ syscall_handler (struct intr_frame *f)
       memread_user(f->esp + 4, &fd, sizeof(fd));
       memread_user(f->esp + 8, &position, sizeof(position));
 
-      sys_seek(fd, position);
+      seek(fd, position);
       break;
     }
 
@@ -227,7 +227,7 @@ syscall_handler (struct intr_frame *f)
 
       memread_user(f->esp + 4, &fd, sizeof(fd));
 
-      return_code = sys_tell(fd);
+      return_code = tell(fd);
       f->eax = (uint32_t) return_code;
       break;
     }
@@ -237,7 +237,7 @@ syscall_handler (struct intr_frame *f)
       int fd;
       memread_user(f->esp + 4, &fd, sizeof(fd));
 
-      sys_close(fd);
+      close(fd);
       break;
     }
 
@@ -270,18 +270,18 @@ syscall_handler (struct intr_frame *f)
     printf("[ERROR] system call %d is unimplemented!\n", syscall_number);
 
     // ensure that waiting (parent) process should wake up and terminate.
-    sys_exit(-1);
+    exit(-1);
     break;
   }
 
 }
 
 
-void sys_halt(void) {
+void halt(void) {
   shutdown_power_off();
 }
 
-void sys_exit(int status) {
+void exit(int status) {
   printf("%s: exit(%d)\n", thread_current()->name, status);
 
   // The process exits.
@@ -299,7 +299,7 @@ void sys_exit(int status) {
   thread_exit();
 }
 
-pid_t sys_exec(const char *cmdline) {
+pid_t exec(const char *cmdline) {
   _DEBUG_PRINTF ("[DEBUG] Exec : %s\n", cmdline);
 
   check_user((const uint8_t*) cmdline);
@@ -310,12 +310,12 @@ pid_t sys_exec(const char *cmdline) {
   return pid;
 }
 
-int sys_wait(pid_t pid) {
+int wait(pid_t pid) {
   _DEBUG_PRINTF ("[DEBUG] Wait : %d\n", pid);
   return process_wait(pid);
 }
 
-bool sys_create(const char* filename, unsigned initial_size) {
+bool create(const char* filename, unsigned initial_size) {
   bool return_code;
 
   // memory validation
@@ -327,7 +327,7 @@ bool sys_create(const char* filename, unsigned initial_size) {
   return return_code;
 }
 
-bool sys_remove(const char* filename) {
+bool remove(const char* filename) {
   bool return_code;
   // memory validation
   check_user((const uint8_t*) filename);
@@ -388,7 +388,7 @@ int sys_filesize(int fd) {
   return ret;
 }
 
-void sys_seek(int fd, unsigned position) {
+void seek(int fd, unsigned position) {
   lock_acquire (&filesys_lock);
   struct file_desc* file_d = find_file_desc(thread_current(), fd);
 
@@ -396,12 +396,12 @@ void sys_seek(int fd, unsigned position) {
     file_seek(file_d->file, position);
   }
   else
-    return; // TODO need sys_exit?
+    return; // TODO need exit?
 
   lock_release (&filesys_lock);
 }
 
-unsigned sys_tell(int fd) {
+unsigned tell(int fd) {
   lock_acquire (&filesys_lock);
   struct file_desc* file_d = find_file_desc(thread_current(), fd);
 
@@ -410,13 +410,13 @@ unsigned sys_tell(int fd) {
     ret = file_tell(file_d->file);
   }
   else
-    ret = -1; // TODO need sys_exit?
+    ret = -1; // TODO need exit?
 
   lock_release (&filesys_lock);
   return ret;
 }
 
-void sys_close(int fd) {
+void close(int fd) {
   lock_acquire (&filesys_lock);
   struct file_desc* file_d = find_file_desc(thread_current(), fd);
 
@@ -428,7 +428,7 @@ void sys_close(int fd) {
   lock_release (&filesys_lock);
 }
 
-int sys_read(int fd, void *buffer, unsigned size) {
+int read(int fd, void *buffer, unsigned size) {
   // memory validation : [buffer+0, buffer+size) should be all valid
   check_user((const uint8_t*) buffer);
   check_user((const uint8_t*) buffer + size - 1);
@@ -441,7 +441,7 @@ int sys_read(int fd, void *buffer, unsigned size) {
     for(i = 0; i < size; ++i) {
       if(! put_user(buffer + i, input_getc()) ) {
         lock_release (&filesys_lock);
-        sys_exit(-1); // segfault
+        exit(-1); // segfault
       }
     }
     ret = size;
@@ -470,7 +470,7 @@ int sys_read(int fd, void *buffer, unsigned size) {
   return ret;
 }
 
-int sys_write(int fd, const void *buffer, unsigned size) {
+int write(int fd, const void *buffer, unsigned size) {
   // memory validation : [buffer+0, buffer+size) should be all valid
   check_user((const uint8_t*) buffer);
   check_user((const uint8_t*) buffer + size - 1);

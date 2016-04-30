@@ -1,0 +1,602 @@
+\documentclass[a4paper,article,11pt,oneside]{article}
+\usepackage{fullpage}
+
+\begin{document}
+\title{Report for OS Project \#4 (2011 Fall)\\Team 071}
+\author{Jeehoon Kang\\\texttt{jhkang@ropas.snu.ac.kr}\and
+  Jonghyuk Lee\\\texttt{jonghyuk0605@gmail.com} \and
+  Taekwon Lee\\\texttt{tkwonlee@hotmail.com} }
+\maketitle
+
+\section{Introduction}
+For this project, we changed \texttt{filesys/cache.[ch],
+  filesys/filesys.c, filesys/inode.c, threads/init.c,
+  threads/thread.c, userprog/exception.c, userprog/process.c}.
+
+This article is structured as follows. Section~\ref{seccache} shows
+details of disk cache. TODO Section~\ref{secconclusion} concludes.
+
+Note that our Mercurial repository is based at
+\texttt{https://bitbucket.org/lunaticas/os}. Later, we address
+revisions or files without explicitly mentioning the repository.
+
+\section{Disk Cache}\label{seccache}
+The naive implementation of Pintos distribution reads from and writes
+to the disk inefficiently. To read from the disk, first read the
+entire block which contains needed data from the disk, and copy the
+data to the destination. To write to the disk, it first reads the entire
+block which should be updated, updates the data, and writes the
+updated block to the disk.
+
+To overcome, we maintain a cache management system.
+\begin{itemize}
+\item A read or write request is divided into several block read and
+  write requests.
+\item Before read and write a block, a process should obtain
+  appropriate privileges for the cache for the block.
+\item Cache management system cares about concurrency synchronization.
+\item Cache management system tries to reduce the number of disk
+  operations by maintaining a pool of caches.
+\item To fail-proof, Cache management system regularly applies the
+  changes in the pool of caches to the disk.
+\end{itemize}
+
+This system is mainly implemented in \texttt{filesys/cache.[ch]}.
+
+\subsection{Cache as a Resource}
+Since disk cache is shared among processes, it should be treated as a
+resources. We protect disk caches with readers-writer lock.
+\begin{verbatim}
+// cache.h
+enum cache_lock_type
+{
+  READ_ONLY,
+  READ_WRITE
+};
+
+// cache.c
+struct cache_block 
+{
+  bool valid;
+  bool loaded;
+  bool dirty;
+  disk_sector_t sector;
+  uint8_t data[DISK_SECTOR_SIZE];
+  int readers, writers, read_waiters, write_waiters;
+  struct lock data_lock;
+  struct lock rw_lock;
+  struct condition read, write;
+};
+\end{verbatim}
+
+\texttt{valid} means the cache is occupied. \texttt{loaded} means the
+data is in sync with the disk. \texttt{dirty} means the data is
+updated from the data in the disk. \texttt{sector} is the index for
+the block in the disk. \texttt{data} is the block data. Other members
+are for readers-writer lock.
+
+\texttt{cache\_acquire, cache\_release} is for acquiring and releasing
+the cache as a resource. The API is very standard and the
+implementation follows conventional readers-writer lock scheme, so we
+do not present a detailed description.
+
+\subsection{Implementation of the Disk Cache}
+The following function actually loads the data from the disk.
+\begin{verbatim}
+static void
+cache_load (struct cache_block *cache)
+{
+  if (!cache->loaded)
+  {
+    disk_read (filesys_disk, cache->sector, cache->data);
+    cache->loaded = true;
+    cache->dirty = false;
+  }
+}
+\end{verbatim}
+
+The following function reads data from the disk cache. Before copying,
+the function makes sure that the cache is loaded.
+\begin{verbatim}
+void
+cache_read (struct cache_block *cache, int offset, int size, uint8_t *buffer)
+{
+  lock_acquire (&cache->data_lock);
+  cache_load (cache);
+  memcpy (buffer, cache->data + offset, size);
+  lock_release (&cache->data_lock);
+}
+\end{verbatim}
+
+The following function writes data to the disk cache. Before copying,
+the function makes sure that the cache is loaded, unless the whole
+cache is being written. The second function is only for convenience.
+\begin{verbatim}
+void
+cache_write (struct cache_block *cache, int offset, int size, const uint8_t *buffer)
+{
+  lock_acquire (&cache->data_lock);
+  if (offset == 0 && size == DISK_SECTOR_SIZE)
+  {
+    cache->loaded = true;
+  }
+  else
+  {
+    cache_load (cache);
+  }
+  memcpy (cache->data + offset, buffer, size);
+  cache->dirty = true;
+  lock_release (&cache->data_lock);
+}
+
+void
+cache_fillzero (struct cache_block *cache)
+{
+  cache_load (cache);
+  memset (cache->data, 0, sizeof (cache->data));
+  cache->dirty = true;
+}
+\end{verbatim}
+
+If we need to allocate a cache to a disk block, we need to find a
+blank cache. The following function does it. At first, it finds a
+non-occupied cache spot. If such cache spot does not exist, find a
+cache which is not allocated by any processes.
+\begin{verbatim}
+static struct cache_block *
+cache_victim (void)
+{
+  struct cache_block *cache;
+
+  int count;
+  for (count = 0; true; victim_idx = (victim_idx + 1) % CACHE_SIZE, ++count)
+  {
+    cache = &cache_table[victim_idx];
+
+    if (!cache->valid)
+    {
+      break;
+    }
+
+    if (count >= CACHE_SIZE && cache->readers == 0 && cache->writers == 0 &&
+        cache->read_waiters == 0 && cache->write_waiters == 0)
+    {
+      cache_flush (cache);
+      break;
+    }
+  }
+
+  cache->valid = false;
+  cache->loaded = false;
+  cache->dirty = false;
+
+  return cache;
+}
+\end{verbatim}
+
+The following function is for cache read-ahead. It pushes the
+requested block to a designated list.
+\begin{verbatim}
+void
+cache_read_request (disk_sector_t sector)
+{
+  struct read_info *read = (struct read_info *) malloc (sizeof (struct read_info));
+  if (read == NULL)
+  {
+    return;
+  }
+
+  read->sector = sector;
+  lock_acquire (&read_lock);
+  list_push_back (&read_list, &read->elem);
+  cond_signal (&read_list_nonempty, &read_lock);
+  lock_release (&read_lock);
+}
+\end{verbatim}
+
+For cache read-ahead, we maintain a daemon thread to work on the list.
+\begin{verbatim}
+// thread_start (void), threads/thread.c
+#ifdef FILESYS
+  thread_create ("cache_flushd", PRI_MIN, cache_flushd, NULL);
+  thread_create ("cache_readd", PRI_MIN, cache_readd, NULL);
+#endif
+
+void
+cache_readd (void *aux UNUSED)
+{
+  while (true)
+  {
+    lock_acquire (&read_lock);
+    while (list_empty (&read_list))
+    {
+      cond_wait (&read_list_nonempty, &read_lock);
+    }
+    struct read_info *read = list_entry (list_pop_front (&read_list),
+                                         struct read_info, elem);
+    lock_release (&read_lock);
+
+    struct cache_block *cache = cache_acquire (read->sector, READ_ONLY);
+    cache_load (cache);
+    cache_release (cache);
+    free (read);
+  }
+}
+\end{verbatim}
+
+Another daemon thread is for regular disk flush to prevent accidental
+disk failure. Note that \texttt{cache\_flush} is also used in
+\texttt{cache\_victim} to clean the victim cache.
+\begin{verbatim}
+void
+cache_flushd (void *aux UNUSED)
+{
+  while (true)
+  {
+    timer_sleep (5);
+    cache_flush_all ();
+  }
+}
+
+void cache_flush_all (void)
+{
+  int i;
+
+  for (i = 0; i < CACHE_SIZE; ++i)
+  {
+    lock_acquire (&cache_lock);
+    struct cache_block *cache = &cache_table[i];
+    if (cache->valid)
+    {
+      cache_flush (cache);
+    }
+    lock_release (&cache_lock);  
+  }
+}
+
+void
+cache_flush (struct cache_block *cache)
+{
+  lock_acquire (&cache->data_lock);
+
+  if (cache->loaded && cache->dirty)
+  {
+    disk_write (filesys_disk, cache->sector, cache->data);
+    cache->dirty = false;
+  }
+
+  lock_release (&cache->data_lock);
+}
+\end{verbatim}
+
+In addition, \texttt{filesys\_done} calls \texttt{cache\_flush\_all}
+to ensure that the disk is in sync.
+
+\subsection{API of Disk Cache}
+Without disk caches, Pintos distribution called \texttt{disk\_read,
+  disk\_write} for disk I/O. With disk caches, we first acquire
+appropriate privileges for the cache for the block, I/O, then release
+the cache.
+\begin{verbatim}
+- disk_read (filesys_disk, inode->sector, &inode->data);
++ struct cache_block *cache = cache_acquire (inode->sector, READ_ONLY);
++ cache_read (cache, 0, DISK_SECTOR_SIZE, (uint8_t *) &inode->data);
++ cache_release (cache);
+\end{verbatim}
+
+The changes are in \texttt{inode.c} and straightforward.
+
+\section{Subdirectories}\label{secdir}
+The file system implementation of Pintos distribution already includes
+the notion of directories. However, to utilize these functions,
+we have to bridge between the file system and the system calls. In
+this section, we describes how to do it.
+
+\subsection{Current Directory}
+We store the current directory for each thread.
+\begin{verbatim}
+static bool
+handle_chdir (const char *path)
+{
+  struct file *file = filesys_open (path);
+  if (file == NULL)
+  {
+    return false;
+  }
+
+  thread_set_pwd (thread_current (), dir_open (file_get_inode (file)));
+  file_close (file);
+  return true;
+}
+\end{verbatim}
+\begin{verbatim}
+// init_thread, init.c
+  #ifdef USERPROG
+  t->pwd = NULL;
+  #endif
+
+void thread_set_pwd (struct thread *t, struct dir *dir)
+{
+  dir_close (t->pwd);
+  t->pwd = dir;
+}
+
+const struct dir *thread_get_pwd (struct thread *t)
+{
+  return t->pwd;
+}
+\end{verbatim}
+
+\subsection{Open}
+System calls related to files only deals with file descriptors,
+except for the \texttt{open} function. This function gets the path of
+a file as an argument. We have to parse it to support subdirectories.
+
+\begin{verbatim}
+// syscall.c
+static int
+handle_open (const char *file_name)
+{
+  ...
+  struct file *file_opened = filesys_open (file_name);
+  ...
+}
+
+// filesys.c
+struct file *
+filesys_open (const char *path)
+{
+  struct inode *inode = dir_find (path);
+  return file_open (inode);
+}
+\end{verbatim}
+
+\texttt{dir\_find} finds the structure of directory for the given
+path. It parses the path, iteratively finds the next-level
+subdirectory, and returns the inode for the last element. Note that
+the initial directory is the root directory or the current directory,
+according to the first character of the path. The parsing is very
+similar to that of argument, and the implementation is
+straightforward.
+\begin{verbatim}
+// directory.h
+struct inode *dir_find (const char *);
+\end{verbatim}
+
+\subsection{Create}
+To create a file, we have to split the path to two parts: one for the
+existing path, and the other for the name of the file to be
+created. \texttt{dir\_split} do this.
+\begin{verbatim}
+// directory.c
+bool dir_split (const char *path, struct inode **inode, char *to);
+\end{verbatim}
+It gets the path, and returns to the second and the third pointer
+arguments. The second inode argument for the path where the new file
+will be created, and the third string argument for the name of the
+file to be created. Return value means whether parsing succeeded.
+
+To create a file, first parse the path, locate the directory, allocate
+a new inode for the file, then add it to the directory.
+\begin{verbatim}
+// syscall.c
+static int
+handle_create (const char *path, off_t file_size)
+{
+  if (!is_valid_memory_filecheck (path))
+  {
+    handle_exit (-1);
+  }
+  lock_acquire (&file_lock);
+  int result = filesys_create (path, file_size);
+  lock_release (&file_lock);
+  return result;
+}
+
+// filesys.c
+bool
+filesys_create (const char *path, off_t initial_size) 
+{
+  disk_sector_t inode_sector = 0;
+  struct inode *inode;
+  struct dir *dir = NULL;
+  char name[NAME_MAX + 1];
+
+  bool success = (dir_split (path, &inode, name)
+                  && (dir = dir_open (inode))
+                  && free_map_allocate (1, &inode_sector)
+                  && inode_create (inode_sector, initial_size, false)
+                  && dir_add (dir, name, inode_sector));
+  if (!success && inode_sector != 0) 
+    free_map_release (inode_sector, 1);
+  dir_close (dir);
+
+  return success;
+}
+\end{verbatim}
+
+\subsection{Remove}
+To remove a file or directory, parse the path, and remove the file
+from the directory.
+\begin{verbatim}
+bool
+filesys_remove (const char *path)
+{
+  struct inode *inode;
+  struct dir *dir = NULL;
+  char name[NAME_MAX + 1];
+
+  bool success = (dir_split (path, &inode, name)
+                  && (dir = dir_open (inode))
+                  && dir_remove (dir, name));
+  dir_close (dir);
+
+  return success;
+}
+\end{verbatim}
+
+\subsection{Is it Directory?}
+To discern directories from ordinary files, we have to store a flag
+for each inode.
+\begin{verbatim}
+// inode.c
+struct inode_disk
+  {
+    disk_sector_t start;                /* First data sector. */
+    off_t length;                       /* File size in bytes. */
+    bool is_dir;
+    unsigned magic;                     /* Magic number. */
+    uint32_t unused[124];               /* Not used. */
+  };
+
+bool inode_create (disk_sector_t sector, off_t length, bool is_dir)
+{
+  ...
+}
+
+bool
+inode_isdir (const struct inode *inode)
+{
+  return inode->data.is_dir;
+}
+
+// directory.c
+bool
+dir_create (disk_sector_t sector, size_t entry_cnt) 
+{
+  return inode_create (sector, entry_cnt * sizeof (struct dir_entry), true);
+}
+\end{verbatim}
+
+The flag is used to check whether a non-directory is opened as a
+directory, and to dispatch the system calls across directories and
+ordinary files.
+
+To see whether a file descriptor represents a directory, just check
+it.
+\begin{verbatim}
+static bool
+handle_isdir (int fd)
+{
+  struct file *file = fd_get (fd);
+  return inode_isdir (file_get_inode (file));
+}
+\end{verbatim}
+
+Similarly for the inumber.
+\begin{verbatim}
+static int
+handle_inumber (int fd)
+{
+  return inode_get_inumber (file_get_inode (fd_get (fd)));
+}
+\end{verbatim}
+
+\subsection{Change Directory}
+To change the current directory, open the directory, and set the
+current directory of the current thread to be it.
+\begin{verbatim}
+static bool
+handle_chdir (const char *path)
+{
+  struct file *file = filesys_open (path);
+  if (file == NULL)
+  {
+    return false;
+  }
+
+  thread_set_pwd (thread_current (), dir_open (file_get_inode (file)));
+  file_close (file);
+  return true;
+}
+\end{verbatim}
+
+\subsection{Make Directory}
+Making a new directory is very similar to making a new file. The only
+difference is calling \texttt{dir\_create} rather than
+\texttt{inode\_create} and add \texttt{., ..} the the directory.
+\begin{verbatim}
+bool
+filesys_mkdir (const char *path) 
+{
+  disk_sector_t inode_sector = 0;
+  struct inode *inode;
+  struct dir *dir = NULL;
+  char name[NAME_MAX + 1];
+
+  bool success = (dir_split (path, &inode, name)
+                  && (dir = dir_open (inode))
+                  && free_map_allocate (1, &inode_sector)
+                  && dir_create (inode_sector, 16)
+                  && dir_add (dir, name, inode_sector));
+  dir_close (dir);
+  success = success
+                  && (dir = dir_open (inode_open (inode_sector)))
+                  && dir_add (dir, ".", inode_sector)
+                  && dir_add (dir, "..", inode_get_inumber (inode));
+  if (!success && inode_sector != 0) 
+    free_map_release (inode_sector, 1);
+  dir_close (dir);
+
+  return success;
+}
+\end{verbatim}
+
+\subsection{Read Directory}
+Though \texttt{dir\_readdir} is already implemented, we have to modify
+this to prevent it from returning \texttt{., ..}.
+\begin{verbatim}
+bool
+dir_readdir (struct dir *dir, char name[NAME_MAX + 1])
+{
+  struct dir_entry e;
+
+  while (inode_read_at (dir->inode, &e, sizeof e, dir->pos) == sizeof e) 
+    {
+      dir->pos += sizeof e;
+      if (e.in_use)
+        {
+            if (strcmp (e.name, ".") != 0 && strcmp (e.name, "..") != 0)
+            {
+              strlcpy (name, e.name, NAME_MAX + 1);
+              return true;
+            }
+        } 
+    }
+  return false;
+}
+\end{verbatim}
+
+Since \texttt{readdir} system call modifies the status of the file
+descriptor and \texttt{dir\_readdir} modifies the status of
+\texttt{dir} structure, we have to store a \texttt{dir} structure for
+each file descriptor. We changed the file descriptor management system
+to store and used it for \texttt{readdir} system call.
+\begin{verbatim}
+static bool
+handle_readdir (int fd_id, char *name)
+{
+  if (!fd_is_valid (fd_id))
+  {
+    handle_exit (-1);
+  }
+  
+  if (!is_valid_memory_filecheck (name))
+  {
+    handle_exit (-1);
+  }
+  
+  struct dir *dir = fd_get_dir (fd_id);
+  if (dir == NULL)
+  {
+    return false;
+  }
+  return dir_readdir (dir, name);
+}
+\end{verbatim}
+
+\section{Conclusion}\label{secconclusion}
+We implement a disk cache management system with easy API. It is
+deliberately designed to avoid concurrency issues. We also implemented
+a file system with subdirectories and corresponding system calls.
+\end{document}

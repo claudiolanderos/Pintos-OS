@@ -1,29 +1,17 @@
-BUILD_SUBDIRS = threads userprog vm filesys
+all: src doc
 
-all::
-	@echo "Run 'make' in subdirectories: $(BUILD_SUBDIRS)."
-	@echo "This top-level make has only 'clean' targets."
+src: bochs pintos
 
-CLEAN_SUBDIRS = $(BUILD_SUBDIRS) examples utils
+bochs:
+	cd src; make bochs
 
-clean::
-	for d in $(CLEAN_SUBDIRS); do $(MAKE) -C $$d $@; done
-	rm -f TAGS tags
+pintos:
+	cd src; make pintos
 
-distclean:: clean
-	find . -name '*~' -exec rm '{}' \;
+doc:
+	cd doc; make all
 
-TAGS_SUBDIRS = $(BUILD_SUBDIRS) devices lib
-TAGS_SOURCES = find $(TAGS_SUBDIRS) -name \*.[chS] -print
+clean:
+	cd src; make clean
+	cd doc; make clean
 
-TAGS::
-	etags --members `$(TAGS_SOURCES)`
-
-tags::
-	ctags -T --no-warn `$(TAGS_SOURCES)`
-
-cscope.files::
-	$(TAGS_SOURCES) > cscope.files
-
-cscope:: cscope.files
-	cscope -b -q -k

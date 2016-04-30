@@ -1,0 +1,459 @@
+\documentclass[a4paper,article,11pt,oneside]{article}
+\usepackage{fullpage}
+
+\begin{document}
+\title{Report for OS Project \#3 (2011 Fall)\\Team 071}
+\author{Jeehoon Kang\\\texttt{jhkang@ropas.snu.ac.kr}\and
+  Jonghyuk Lee\\\texttt{jonghyuk0605@gmail.com} \and
+  Taekwon Lee\\\texttt{tkwonlee@hotmail.com} }
+\maketitle
+
+\section{Introduction}
+For this projec,t we changed \texttt{page.[ch], frame.[ch], swap.[ch]}
+in \texttt{vm} directory and \texttt{init.[ch], thread.[ch],
+  exception.[ch], process.[ch]} in \texttt{threads, userprog}
+directories.
+
+This article is structured as follows. Section~\ref{sechandler} shows
+how default page fault handler is changed. Section~\ref{sectables}
+shows how page and frame tables are used, while section~\ref{secimpl}
+shows how to implement them. Section~\ref{secswap} shows how to swap
+in and out frames. Section~\ref{secconclusion} concludes.
+
+Note that our Mercurial repository is based at
+\texttt{https://bitbucket.org/lunaticas/os}. Later, we address
+revisions or files without explicitly mentioning the repository.
+
+We report that we pass all required test cases in project 3 except for \texttt{pt-write-code}.
+
+\section{Page Fault Handler}\label{sechandler}
+The page fault handler shipped with brand-new pintos distribution
+aborts the machine. To implement virtual memory, we changed the
+behavior of the page fault handler as follows.
+
+\begin{verbatim}
+- in page_fault, exception.c
+if (check_fault (f, fault_addr, not_present, user)) {
+  handle_exit (-1);
+}
+\end{verbatim}
+
+\section{Page and Frame Tables}\label{sectables}
+To implement virtual memory, we have to maintain a page table for each
+thread and the global frame table.
+\begin{itemize}
+\item In booting procedure, init the frame.
+\begin{verbatim}
+- in main, init.c
+  init_frame();
+\end{verbatim}
+\item Each thread has its own page table. When a thread begins and
+  ends, it initializes and free the page and frame tables.
+\begin{verbatim}
+- in struct thread, thread.h
+  struct hash pagetable;
+- in thread_create, thread.c
+  page_table_init (&t->pagetable);
+- in thread_exit, thread.c
+  lock_acquire (&lock_ft);
+  frame_table_free (thread_current ());
+  page_table_free (thread_current ());
+  lock_release (&lock_ft);
+\end{verbatim}
+\item When loading a user process, we allows
+  \texttt{palloc\_get\_page} to fail. When it is the case, we victim a
+  existing page and use it.
+\begin{verbatim}
+- in load_segment, process.c
+    if (kpage == NULL)
+    {
+      kpage = victim ();
+    }
+    ASSERT (kpage != NULL);
+\end{verbatim}
+After loading a page, we set the page table entry for it.
+\begin{verbatim}
+- in load_segment, process.c
+    /* Load this page. */
+    lock_release (&lock_ft);
+    if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
+    {
+      palloc_free_page (kpage);
+      return false; 
+    }
+    lock_acquire (&lock_ft);
+    memset (kpage + page_read_bytes, 0, page_zero_bytes);
+    /* Add the page to the process's address space. */
+    if (!install_page (upage, kpage, writable)) 
+    {
+      palloc_free_page (kpage);
+      lock_release (&lock_ft);
+      return false; 
+    }
+    make_frame_table ( upage, t);
+    page_set_entry ( upage, writable, kpage);
+    lock_release (&lock_ft);
+ /* Advance. */
+    read_bytes -= page_read_bytes;
+    zero_bytes -= page_zero_bytes;
+    upage += PGSIZE;
+    off += page_read_bytes;
+\end{verbatim}
+\item Similary for stacks.
+\begin{verbatim}
+- in setup_stack, process.c
+  if (kpage == NULL)
+  {
+    kpage = victim ();
+  }
+- in setup_stack, process.c
+  success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+  if (success)
+  {
+    *esp = PHYS_BASE;
+    uint8_t *upage = ((uint8_t *) PHYS_BASE) - PGSIZE;
+    make_frame_table (upage, thread_current());
+    page_set_entry (upage, true, kpage);
+  }
+\end{verbatim}
+\end{itemize}
+
+\section{Implementation of Page and Frame Tables}\label{secimpl}
+\subsection{Frame Table}
+We have to implement two operations on the table of pages or frames.
+\begin{enumerate}
+\item to pick the last swapped-in entry to implement the LRU policy.
+\item to search for an entry.
+\end{enumerate}
+The first operation is easy to implement for the list of entries; the
+second, the hash of it. So we maintain the list and the hash of
+entries at the same time. \texttt{init\_frame} is for the global
+initialization function for frames.
+\begin{verbatim}
+- in frame.h
+struct frame_table {
+  uint8_t *page;
+  struct thread *t;
+  struct list_elem elem;
+  struct hash_elem hash_elem;
+}
+struct list frame_list;
+struct hash frame_hash;
+- in init_frame, frame.c
+  list_init(&frame_list);
+  hash_init(&frame_hash, frame_hash_func, frame_less_func, NULL);
+  lock_init(&lock_ft);
+\end{verbatim}
+The choice of hash function and order function for frames is
+not unique. We hash a frame by the integral value of the page of the
+frame and order frames by their page and their owner thread id.
+\begin{verbatim}
+- in frame.c
+unsigned frame_hash_func ( const struct hash_elem *a, void *aux)
+{ struct frame_table *pa = hash_entry (a, struct frame_table, hash_elem);
+ return hash_bytes ( &pa->page, sizeof pa->page);
+}
+bool frame_less_func ( struct hash_elem *a, struct hash_elem *b, void *aux)
+{ struct frame_table *pa = hash_entry ( a, struct frame_table, hash_elem);
+ struct frame_table *pb = hash_entry ( b, struct frame_table, hash_elem);
+ if ( pa->page == pb->page)
+ {
+  return pa->t->tid < pb->t->tid;
+ }
+ return pa->page < pb->page;
+}
+\end{verbatim}
+Utility functions for maintaining the table is as follows.
+\begin{verbatim}
+- in make_frame_table, frame.c
+  struct frame_table *fte = (struct frame_table *)malloc(sizeof(struct frame_table));
+  ASSERT (fte != NULL);
+  fte->page = page;
+  fte->t = t;
+  frame_table_insert(fte);
+- in frame_table_insert, frame.c
+ list_push_back (&frame_list,&f->elem);
+ hash_insert (&frame_hash, &f->hash_elem);
+- in frame_table_find, frame.c
+  struct frame_table a;
+  a.page = page;
+  a.t = t;
+  struct hash_elem *ret = hash_find ( &frame_hash, &a.hash_elem);
+  if ( ret == NULL)
+  {
+    return NULL;
+  }
+  return hash_entry (ret, struct frame_table, hash_elem);
+- in frame_table_free, frame.c
+  struct list_elem *e;
+  struct frame_table *f;
+  for( e = list_begin(&frame_list); e != list_end(&frame_list); )
+  {
+    f = list_entry(e,struct frame_table,elem);      
+    if (f->t == t)
+    {
+      e = list_remove (e);
+      hash_delete ( &frame_hash, &f->hash_elem);
+      free (f);
+    }
+    else
+      e = list_next (e);
+    }
+  }
+- in frame_table_entry_free, frame.c
+  list_remove (&a->elem);
+  hash_delete (&frame_hash, &a->hash_elem);
+  free (a);
+\end{verbatim}
+If memory is scarce, we have to swap out an entry of frame
+table. Following the LRU policy, \texttt{victim ()} victims the oldest
+entry from the list of frame table entry and swap out it.
+\begin{verbatim}
+- in victim, frame.c
+  fte = list_entry(list_pop_front(&frame_list), struct frame_table, elem);
+  frame_thread = fte -> t;
+  upage = fte -> page;
+  /* Free FTE */
+  hash_delete (&frame_hash, &fte->hash_elem);
+  free(fte);
+  p = page_table_find(frame_thread, upage);
+  ASSERT (p != NULL);
+  kpage = pagedir_get_page(frame_thread -> pagedir,upage);
+  ASSERT (kpage != NULL);
+  if ( pagedir_is_dirty ( frame_thread->pagedir, upage)) 
+  {
+    p->dirty = true;
+  }
+  pagedir_clear_page(frame_thread->pagedir, upage);\
+  swap_out (p, kpage);
+  return kpage;
+\end{verbatim}
+
+\subsection{Page Table}
+The details are almost the same with that of frame tables.
+\begin{verbatim}
+- in page.h
+struct page_table{
+  bool swap;
+  bool writable;
+  uint8_t *page;
+  uint8_t *kpage;
+  int swp;
+  bool dirty;
+  bool is_loaded;
+  off_t off;
+  struct hash_elem hash_elem;
+};
+- in page.c
+unsigned page_hash_func ( const struct hash_elem *a, void *aux UNUSED )
+{
+  struct page_table *pa = hash_entry ( a, struct page_table, hash_elem);
+  return hash_bytes ( &pa->page, sizeof pa->page);
+}
+bool page_less_func ( struct hash_elem *a, struct hash_elem *b, void *aux)
+{
+  struct page_table *pa = hash_entry ( a, struct page_table, hash_elem);
+  struct page_table *pb = hash_entry ( b, struct page_table, hash_elem);
+  return pa->page < pb->page;
+}
+- in page.c
+void page_table_init ( struct hash *pagetable )
+{
+  hash_init ( pagetable, page_hash_func, page_less_func, NULL);
+}
+void page_table_insert ( struct hash *pagetable, struct page_table *p)
+{
+  hash_insert ( pagetable, &p->hash_elem);
+}
+- in page_set_entry, page.c
+  struct page_table *p = (struct page_table *)malloc(sizeof(struct page_table));
+  ASSERT (p != NULL);
+  p->swap = false;
+  p->page = upage;
+  p->writable = writable;
+  p->kpage = kpage;
+  p->is_loaded = false;
+  p->dirty = false;
+  page_table_insert ( &(thread_current()->pagetable), p);
+- in page_table_find, page.c
+  struct page_table a;
+  a.page = page;
+  struct hash_elem *ret = hash_find ( &t->pagetable, &a.hash_elem);
+  if ( ret == NULL)
+  {
+    return NULL;
+  }
+  return hash_entry ( ret, struct page_table, hash_elem); 
+- in page_table_entry_free, page.c
+  struct thread *t = thread_current ();
+  hash_delete ( &t->pagetable, &a->hash_elem);
+  if ( a->swap )
+  {
+    d_use[ a->swp/8] = false;
+  } 
+  else if (a->is_loaded) 
+  {
+    pagedir_clear_page(t->pagedir, a->page);
+  }
+  free (a);
+- in page_table_free
+  hash_destroy ( &t->pagetable, page_destructor );
+- in page_destructor, page.c
+  struct page_table *pa = hash_entry ( a, struct page_table, hash_elem);
+  if ( pa->swap )
+  {
+    d_use[ pa->swp/8] = false;
+  }
+  free ( pa );
+\end{verbatim}
+
+One think to focus on is \texttt{check\_fault}. It checks whether the
+access to an address is valid. If it is valid, the function makes sure
+that the corresponding page is swapped in.
+\begin{enumerate}
+\item If the page fault is due to an illegal access, terminate the
+  process, freeing all the resources it acquired.
+\begin{verbatim}
+- in check_fault, page.c
+  if (fault_addr >= PHYS_BASE || fault_addr == 0) {
+    return true;
+  }
+  if (not_present) {
+    if (fault_addr < DENY_ADDR) {
+      return true;
+    }
+    if (pt_no(fault_pg) >= DENY_PAGE_NUM) {
+      return true;
+    }
+  }
+\end{verbatim}
+
+\item Find the page for the accessed address.
+\begin{verbatim}
+- in check_fault, page.c
+  pt = page_table_find (t, fault_pg);
+  if (pt != NULL) {
+    // When Page exists
+    if (!lock_held_by_current_thread (&lock_ft)) 
+    {
+      get_lock_here = true;
+      lock_acquire (&lock_ft);
+    }
+    if (pt->swap) {
+      swap_in (pt, fault_pg);
+      if (get_lock_here) 
+        lock_release (&lock_ft);
+      return false;
+    }
+    NOT_REACHED ();
+  }
+\end{verbatim}
+
+If the page is not found, make a new page table entry.
+\begin{verbatim}
+- in check_fault, page.c
+  if (fault_addr < PHYS_BASE - DENY_USER_MEM) {
+    return true;
+  }
+  if (fault_addr <f->esp-32) {
+    return true; 
+  } 
+  void *upage = fault_pg; 
+  if (!lock_held_by_current_thread (&lock_ft)) 
+  {
+    get_lock_here = true;
+    lock_acquire (&lock_ft);
+  }
+  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  if(kpage == NULL) 
+    kpage = victim ();
+  pagedir_set_page (t->pagedir, upage, kpage, true);
+  make_frame_table (upage, t);
+  page_set_entry (upage, true, kpage);
+  if (get_lock_here)
+  {
+    lock_release (&lock_ft);
+  }
+  return false;
+\end{verbatim}
+\end{enumerate}
+
+\section{Implementation of Swapping}\label{secswap}
+Swapping in and out should read from and write to disk. To this, we
+have to include \texttt{device/disk.[ch]}.
+
+To swap out, we have to find an empty space.
+\begin{verbatim}
+- in find_empty, swap.c
+for (i = 0; i < MAXDD; ++i)
+{
+  if (d_use[i] == false)
+  {
+    d_use[i] = true;
+    return i * BYTE__;
+  }
+}
+NOT_REACHED ();
+\end{verbatim}
+With the empty space found, save the location of the empty space to
+the page table entry, and release the page.
+\begin{verbatim}
+- in swap_out, swap.c
+pte->swp = sec_num;
+pte->swap = true;
+pte->kpage = NULL;
+d = disk_get(1,1);
+swap_d_write(d, sec_num, kpage);
+\end{verbatim}
+\texttt{swap\_d\_write} actually writes on the disk.
+\begin{verbatim}
+- in swap_d_write, swap.c
+for (i=0;i<BYTE__;i++)
+{
+  disk_write(d,sec_num,page);
+  sec_num++;
+  page += P_SIZE;
+}
+\end{verbatim}
+
+To swap in, we allocate a page. If allocation fails, we find a victim.
+\begin{verbatim}
+- in swap_in, swap.c
+kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+if (kpage == NULL) 
+  kpage = victim ();
+\end{verbatim}
+\texttt{swap\_d\_read} actually reads from the disk.
+\begin{verbatim}
+- in swap_d_read, swap.c
+for(i=0;i<BYTE__;i++)
+{
+  disk_read(d,sec_num,page);
+  sec_num++;
+  page += P_SIZE;
+}
+\end{verbatim}
+Finally, mark the disk space to be unused, and reorganize the page and
+frame tables.
+\begin{verbatim}
+- in swap_in, swap.c
+  d_use[pte->swp/8] = false;
+  pte->swap = false;
+  pte->kpage = kpage;
+  make_frame_table ( addr, t );
+  pagedir_set_page(t->pagedir, addr, kpage, true);
+\end{verbatim}
+
+\section{Conclusion}\label{secconclusion}
+We implement an memory management system swapping memory frames
+in-and-out which maintains the assignment of pages and
+frames with an clever page fault handler. Collectively they are called
+virtual memory. We pass all test cases except for
+\texttt{pt-write-code}.
+
+For \texttt{pt-write-code}, the program tries to write on code
+section, which is prohibited. We checked that the page it wants to
+write on is not writable at load time, but we could not figure out why
+the program runs without an exception. We need the exact mechanism for
+pintos to write on and read from memory to solve this problem.
+\end{document}

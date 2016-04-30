@@ -1,0 +1,721 @@
+\documentclass[a4paper,article,11pt,oneside]{article}
+\usepackage{fullpage}
+
+\begin{document}
+\title{Report for OS Project \#2 (2011 Fall)\\Team 071}
+\author{Jeehoon Kang\\\texttt{jhkang@ropas.snu.ac.kr}\and
+  Jonghyuk Lee\\\texttt{jonghyuk0605@gmail.com} \and
+  Taekwon Lee\\\texttt{tkwonlee@hotmail.com} }
+\maketitle
+
+This article is structured as follows. Section~\ref{secarg} deals with
+how to pass arguments to user programs. Setion~\ref{secsys} presents
+the implementation details of system calls, including process
+management system calls, such as process halt, exit, execute, or
+wait, and file management system calls. Section~\ref{secconclusion}
+concludes.
+
+Note that our Mercurial repository is based at
+\texttt{https://bitbucket.org/lunaticas/os}. Later, we address
+revisions or files without explicitly mentioning the repository.
+
+We proudly report that we pass all 76 test cases out of 76.
+
+\section{Argument Passing}\label{secarg}
+When a user program starts, the program should get the arguments of
+the command. For example, typing \texttt{echo x} in a shell should
+execute program \texttt{echo} and pass \texttt{[``echo'', ``x'']} as
+its arguments. The entry point of a typical C program is \texttt{main}
+function, whose declaration is \texttt{int main (int argc, char
+  *argv[])} where \texttt{argc} is the number of arguments and
+\texttt{argv} is the array of argument strings. Function
+\texttt{argument\_parse} parses the argument.
+\begin{verbatim}
+(in process.c)
+static void
+argument_parse (char *cmd, int *argc, char ***argv);
+\end{verbatim}
+
+As 80x86 calling convention, we have to pass arguments to the stack
+before the user program starts. We parse in \texttt{process\_execute}
+and pass it to \texttt{start\_process} because
+\texttt{process\_execute} has to deal with error cases and
+\texttt{start\_process} only can access to \texttt{if\_.esp}. We
+assume that the total length of the argument does not exceed
+\texttt{PGSIZE / 2}.
+
+\begin{verbatim}
+(in process.c, process_execute)
+  strlcpy (cmd, cmd_, PGSIZE);
+  argument_parse (cmd, argc, &argv);
+  *((char ***)(cmd + PGSIZE / 2 + sizeof (int))) = argv;
+(in process.c, start_process)
+  argc = *((int *)(cmd + PGSIZE / 2));
+  argv = *((char ***)(cmd + PGSIZE / 2 + sizeof (int)));
+\end{verbatim}
+
+We put the arguments in the reverse order to the stack
+\texttt{if\_.esp}. After this, we put pointers to the argument strings
+in the revert order, the pointer to the array of pointers to the
+argument strings, and the fake return address \texttt{NULL}.
+\begin{verbatim}
+(in process.c, start_process)
+  for (i = argc - 1; i >= 0; --i)
+  {
+    len = strlen (argv[i]);
+    if_.esp -= (len + 1) * sizeof (char);
+    strlcpy (if_.esp, argv[i], len + 1);
+    argv[i] = if_.esp;
+  }
+
+  if_.esp -= ((size_t) if_.esp) % sizeof (size_t);
+  if_.esp -= sizeof (char *);
+  *((char **) if_.esp) = NULL;
+
+  for (i = argc; i >= 0; --i)
+  {
+    if_.esp -= sizeof (char *);
+    *((char **) if_.esp) = argv[i];
+  }
+
+  if_.esp -= sizeof (void *);
+  *((void **) if_.esp) = if_.esp + sizeof (size_t);
+
+  if_.esp -= sizeof (size_t);
+  *((size_t *) if_.esp) = argc;
+
+  if_.esp -= sizeof (void *);
+  *((void **) if_.esp) = NULL;
+\end{verbatim}
+
+Then we set the thread name to be the first argument, i.e. the name of
+program, and free allocated pages for arguments.
+\begin{verbatim}
+(in process.c, start_process)
+  strlcpy (thread_current ()->name, argv[0], sizeof (thread_current ()->name));
+  palloc_free_page (cmd);
+  palloc_free_page (argv);
+\end{verbatim}
+
+By allocating a new page for pointers to argument strings, it scales
+well unless the total length of command is over \texttt{PGSIZE / 2}.
+
+However, only static number of characters of the name of programs
+are stored in \texttt{struct thread} and printed when processes
+terminate. We decided this is not a serious problem and if it is, we
+can allocate a page for the name.
+
+\section{System Calls}\label{secsys}
+\subsection{User Memory Access}
+System call is the channel between user programs and the kernel so
+that handlers need to read from and write to the user memory. The
+Pintos documentation provides a way to to this by magic assembly
+code. We abstract these details to 1-byte read/write function and
+4-byte read/write function. Note that 80x86 is little endian :)
+\begin{verbatim}
+(in syscall.c)
+static int get_user (const uint8_t *uaddr) { ... }
+static bool put_user (uint8_t *udst, uint8_t byte) { ... }
+static int get_user_4 (const uint8_t *uaddr) { ... }
+static bool put_user_4 (uint8_t *udst, int value) { ... }
+\end{verbatim}
+
+Every system call looks 1 to 4 4-byte values from the stack and
+returns a 4-byte value. The handler dispatches system calls by its
+first 4-byte value input and determines the number of additional
+input values.
+\begin{verbatim}
+(in syscall.c)
+#define SYSCALL(esp) (get_user_4 (esp))
+#define ARG0(esp) (get_user_4 ((esp) + 4))
+[...]
+
+static void
+syscall_handler (struct intr_frame *f) 
+{
+  int result;
+  switch (SYSCALL (f->esp))
+  {
+  case SYS_HALT: result = handle_halt (); break;
+  case SYS_EXIT: result = handle_exit (ARG0(f->esp)); break;
+  [...]
+  }
+
+  put_user_4 (f->eax, result);
+}
+\end{verbatim}
+
+\subsection{Process Management System Calls}\label{secprocess}
+We have to implement 4 process management system calls: \texttt{halt,
+  exit, exec, wait}. \texttt{halt} and \texttt{wait} are relatively
+easy; they just call other functions. An appropriate lock for files is
+needed to prevent illegal access.
+
+\begin{verbatim}
+(in process.c)
+static int
+handle_halt (void)
+{
+  thread_exit ();
+}
+
+static int
+handle_exec (const char *cmd)
+{
+  lock_acquire (&file_lock);
+  int result = process_execute (cmd);
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+\texttt{exit} and \texttt{wait} have to cooperate with each other so
+that \texttt{wait} can receive the exit code from \texttt{exit}. Our
+design relies on \texttt{process.c} and \texttt{thread.c} for this
+cooperation and \texttt{syscall.c} does nearly nothing. \texttt{exit}
+just set the exit code to \texttt{struct thread} and print
+end-of-program message.
+
+\begin{verbatim}
+(in process.c)
+static int
+handle_exit (int exit_code)
+{
+  thread_current ()->exit_code = exit_code;
+  printf ("%s: exit(%d)\n", thread_current ()->name, exit_code);
+  thread_exit ();
+}
+
+static int
+handle_wait (pid_t pid)
+{
+  return process_wait (pid);
+}
+\end{verbatim}
+
+To implement these functionalities, we store more data on
+\texttt{struct thread}. \texttt{exit\_code} stores the exit code of the
+thread, \texttt{wait\_sema} provides synchronization for
+\texttt{process\_wait}, \texttt{load\_sema} and \texttt{load\_status}
+for \texttt{process\_execute} to know whether the load succeed,
+and \texttt{parent} for storing who is the parent.
+\begin{verbatim}
+(in thread.h, struct thread)
+#ifdef USERPROG
+    int exit_code;
+    struct semaphore wait_sema;
+    struct semaphore load_sema;
+    struct thread *parent;
+    struct file *self;
+    bool load_status;
+#endif
+\end{verbatim}
+
+When a user program is loaded, \texttt{start\_process} signals whether
+the load was successful to \texttt{process\_execute} using a semaphore.
+\begin{verbatim}
+(in process.c, process_execute)
+  tid = thread_create (cmd, PRI_DEFAULT, start_process, cmd);
+  if (tid == TID_ERROR)
+  {
+    palloc_free_page (cmd);
+    return TID_ERROR;
+  }
+
+  struct thread *t = thread_lookup (tid);
+  sema_down (&t->load_sema);
+
+  if (!t->load_status)
+  {
+    return TID_ERROR;
+  }
+
+  return tid;
+
+(in process.c, start_process)
+  if (!success)
+  {
+    palloc_free_page (cmd);
+    thread_current ()->load_status = false;
+    sema_up (&thread_current ()->load_sema);
+    handle_exit (-1);
+  }
+
+  (...)
+
+  palloc_free_page (cmd);
+  thread_current ()->load_status = true;
+  sema_up (&thread_current ()->load_sema);
+\end{verbatim}
+
+Originally, when \texttt{thread\_exit} is called, the page for the
+thread is freed immediately. However, to satisfy the specification for
+\texttt{wait}, we have to remember the exit codes of already dead
+threads. So instead of freeing immediately after a thread is exited,
+we add the thread to the \texttt{dead\_list} and \texttt{sema\_up} the
+semaphore \texttt{wait\_sema} for \texttt{process\_wait} to get a
+signal to wake up.
+\begin{verbatim}
+(in thread.c, thread_exit)
+  list_push_back (&dead_list, &t->allelem);
+  sema_up (&t->wait_sema);
+(in thread.c, schedule_tail, when a thread is dying)
+#ifndef USERPROG
+      palloc_free_page (prev);
+#endif
+\end{verbatim}
+
+If a thread is terminated, the exit codes of the children of it are no
+more needed. In \texttt{thread\_exit}, we free the memory for this information.
+\begin{verbatim}
+(in thread.c, thread_exit)
+  struct list_elem *e;
+  for (e = list_begin (&dead_list); e != list_end (&dead_list); )
+  {
+    struct thread *t = list_entry (e, struct thread, allelem);
+    e = list_next (e);
+    if (t->parent == thread_current ())
+    {
+      thread_remove (t);
+    }
+  }    
+\end{verbatim}
+
+When a thread waits for one of its child, now the thread just
+\texttt{sema\_down} the semaphore \texttt{wait\_sema} of the child,
+which is acquired only after the child thread die. After the parent
+getthe exit code of the child, the child is removed completely because
+its exit code is no more needed.
+\begin{verbatim}
+(in process.c, process_wait)
+int
+process_wait (tid_t child_tid) 
+{
+  int result;
+  struct thread *child = thread_lookup (child_tid);
+
+  if (child == NULL || child->parent != thread_current ())
+  {
+    return -1;
+  }
+
+  sema_down (&child->wait_sema);
+  result = child->exit_code;
+  thread_remove (child);
+  return result;
+}
+\end{verbatim}
+
+For this, we have to implement \texttt{thread\_lookup} which finds
+the thread of given \texttt{tid} regardless of their liveness. To list
+up dead threads, we defined \texttt{dead\_list}. \texttt{thread\_remove}
+removes a thread from \texttt{dead\_list} and free the memory of
+\texttt{struct thread}.
+
+\begin{verbatim}
+(in thread.c)
+void
+thread_remove (struct thread *t)
+{
+  enum intr_level old_level;    
+  old_level = intr_disable ();
+  list_remove (&t->allelem);
+  palloc_free_page (t);
+  intr_set_level (old_level);  
+}
+\end{verbatim}
+
+In our design, \texttt{process\_wait} does not block for already dead
+thread and with a semaphore, we gurantee it returns as soon as the
+child die (and of course, after the parent is scheduled to run).
+
+However, we does not free one page for each \texttt{struct thread}
+whose parent did neither \texttt{process\_wait} nor
+\texttt{thread\_exit} yet. We decided this is not a serious problem
+and if it is, we can introduce a new data structure for efficiently
+storing exit codes.
+
+\subsection{File Management System Calls}\label{secfile}
+
+We implement \texttt{create, remove, open, filesize, read, write,
+  seek, tell} and \texttt{close}. In \texttt{fd.c}, we manage file
+descriptors. When we handle files, we resort to functions in
+\texttt{filesys.c, file.c}.
+
+We introduce a lock named \texttt{file\_lock}, because file processing
+should be mutually protected. When another thread handles the file, a
+thread has to wait.
+
+File descriptor is an abstract indicator for accessing a file. A
+process can manage many files so that a process can have many file
+descriptors. A file descriptor is a nonnegative integer global to the
+system, so file descriptor manager has to remember the owner, the
+file, and the status of each file descriptor.
+
+\begin{verbatim}
+(in fd.c)
+struct file_descriptor
+{
+  struct file *file;
+  struct thread *owner;
+  bool status;
+};
+
+void
+fd_init (void)
+{
+  fd_cnt = 3;
+  empty_fd_cnt = 0;
+}
+\end{verbatim}
+
+Note that the number 0 is for \texttt{STDIN}; 1, \texttt{STDOUT}; 2,
+\texttt{STDERR}. File descriptor manager consists of auxiliary
+functions including validity check, file descriptor allocation,
+deallocation, and file access.
+
+\begin{verbatim}
+(in fd.c)
+fd_is_valid (int fd_id)
+{
+  if (fd_id < 3 || fd_id >= fd_cnt)
+  {
+    return false
+  }
+  if (fd_list[fd_id].status == false)
+  {
+    return false
+  }
+  if (fd_list[fd_id].owner->tid != thread_current()->tid)
+  {
+    return false
+  }
+  return true
+}
+
+fd_acquire (struct file *file)
+{
+  int fd_id;
+  if (empty_fd_cnt > 0)
+  {
+    fd_id = empty_fd_list[--empty_fd_cnt];
+  }
+  else
+  {
+    fd_id = fd_cnt++;
+  }
+  fd_list[fd_id].file = file;
+  fd_list[fd_id].owner = thread_current ();
+  fd_list[fd_id].status = true;
+  return fd_id;
+}
+
+void fd_release (int fd_id)
+{
+  file_close (fd_list[fd_id].file);
+  fd_list[fd_id].status = false;
+  empty_fd_list[empty_fd_cnt++] = fd_id;
+}
+
+struct file *
+fd_get (int fd_id)
+{
+  return fd_list[fd_id].file;
+}
+\end{verbatim}
+
+When a process terminates, all the files assigned to the process
+should be released. In \texttt{process\_exit},
+\texttt{fd\_process\_exit} is called.
+
+\begin{verbatim}
+(in fd.c)
+void
+fd_process_exit (struct thread *t)
+{
+  int i;
+  for (i = 3; i < fd_cnt; ++i)
+  {
+    if (fd_list[i].owner->tid == t->tid &&
+        fd_list[i].status)
+    {
+      fd_release (i);
+    }
+  }
+}
+\end{verbatim}
+
+With the file descriptor manager, many file-related system calls are
+implemented in a straightforward and natural way.
+
+\begin{verbatim}
+(in syscall.c)
+static int
+handle_create (const char *file_name, off_t file_size)
+{
+  if (!is_valid_memory_filecheck (file_name))
+  {
+    handle_exit(-1);
+  }
+  lock_acquire (&file_lock);
+  int result = filesys_create (file_name, file_size);
+  lock_release (&file_lock);
+  return result;
+}
+
+static int
+handle_remove (const char *file_name)
+{
+  if (!is_valid_memory_filecheck (file_name))
+  {
+    handle_exit(-1);
+  }
+  lock_acquire (&file_lock);
+  int result = filesys_remove (file_name);
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+Handlers \texttt{handle\_create} and \texttt{handle\_remove} relies on
+predefined \texttt{filesys\_create} and \texttt{filesys\_remove}. If
+the address of file name is not valid, it is error so we exit and
+return -1. We acquire the \texttt{file\_lock} before calling file
+managing functions for avoiding collision.
+
+\begin{verbatim}
+(in syscall.c)
+static int
+handle_open (const char *file_name)
+{
+  if (!is_valid_memory_filecheck (file_name))
+  {
+    handle_exit(-1);
+  }
+
+  lock_acquire (&file_lock);
+  struct file *file_opened = filesys_open (file_name);
+
+  if (file_opened == NULL)
+  {
+    lock_release (&file_lock);
+    return -1;
+  }
+
+  int result = fd_acquire (file_opened);
+  lock_release (&file_lock);
+  return result;
+}
+static int
+handle_close (const int fd_id)
+{
+  if (!fd_is_valid (fd_id))
+  {
+    handle_exit (-1);
+  }
+  
+  lock_acquire (&file_lock);
+  fd_release (fd_id);
+  lock_release (&file_lock);
+  return 0;
+}
+\end{verbatim}
+
+Handlers \texttt{handle\_open} and \texttt{handle\_close} relies on
+predefined \texttt{filesys\_open} and \texttt{file\_close}. We also need to validate address or acquire lock in this function. And in \texttt{handle\_open} function, after we open file with \texttt{filesys\_open}, we call \texttt{fd\_acquire} to get file descriptor. Then \texttt{fd\_acquire} in \texttt{fd.c} returns valid file descriptor of this opened file. When we close file, we call \texttt{fd\_release} to release file descriptor. Closing file process is included in there.
+
+\begin{verbatim}
+(in syscall.c)
+static int 
+handle_read (const int fd_id, char *buf, const int size) 
+{
+  if (!is_valid_memory_filecheck (buf) || !is_user_vaddr (buf + size))
+  {
+    handle_exit (-1);
+  }
+
+  lock_acquire (&file_lock);
+  if (fd_id == STDIN_FILENO)
+  {
+    int i;
+    for (i = 0; i < size; ++i)
+    {
+      buf[i] = input_getc ();
+    }
+    lock_release (&file_lock);
+    return size;
+  }
+
+  if (!fd_is_valid (fd_id))
+  {
+    lock_release (&file_lock);
+    return -1;
+  }
+
+  struct file *fp = fd_get (fd_id);
+  int result = file_read (fp, buf, size);
+
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+Handler \texttt{handle\_read} relies on predefined
+\texttt{input\_getc} and \texttt{file\_read}. After we validate
+address of buffer, we determine whether it is standard input or
+not. If it is standard input, we use input\_getc to get input. If it
+is not, first we check whether file descriptor is valid or not by
+calling  \texttt{is\_valid\_fd} in  \texttt{fd.c}. After it, we call
+\texttt{file\_read} function to read file. This function is also
+protected by the \texttt{file\_lock}.
+
+\begin{verbatim}
+(in syscall.c)
+static int 
+handle_write (const int fd_id, const char *buf, const int size)
+{
+  if (!is_valid_memory_filecheck (buf) || !is_user_vaddr (buf + size))
+  {
+    handle_exit (-1);
+  }
+
+  lock_acquire (&file_lock);
+  if (fd_id == STDOUT_FILENO)
+  {
+    putbuf (buf, size);
+    lock_release (&file_lock);
+    return size;
+  }
+  
+  if (!fd_is_valid (fd_id))
+  {
+    lock_release (&file_lock);
+    return -1;
+  }
+
+  int result = file_write (fd_get (fd_id), buf, size);
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+Handler \texttt{handle\_write} relines on predefined \texttt{putbuf}
+and  \texttt{file\_write}. After we validate address of buffer, we
+determine whether it is standard output or not. If it is standard
+output, we use putbuf to put output. If it is not, we check whether
+file descriptor is valid or not here too. After it, we call
+\texttt{file\_write} function to write file. This function is also
+protected by the \texttt{file\_lock}.
+
+\begin{verbatim}
+(in syscall.c)
+static int
+handle_seek (const int fd_id, const int position) 
+{
+  if (!fd_is_valid (fd_id))
+  {
+    return -1;
+  }
+
+  lock_acquire (&file_lock);
+  file_seek (fd_get (fd_id), position);
+  lock_release (&file_lock);
+  return 0;
+}
+
+static int
+handle_tell (const int fd_id) 
+{
+  if (!fd_is_valid (fd_id))
+  {
+    return -1;
+  }
+
+  lock_acquire (&file_lock);
+  int result = file_tell (fd_get (fd_id));
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+Handlers \texttt{handle\_seek} and  \texttt{handle\_tell} relies on
+predefined \texttt{file\_seek} and  \texttt{file\_tell}. We also need
+to validate address or acquire lock in this function. And in both
+functions, we find the file of given file descriptor by calling \texttt{fd\_get} of \texttt{fd.c}.
+
+\begin{verbatim}
+(in syscall.c)
+static int
+handle_filesize (const int fd_id) 
+{
+  if (!fd_is_valid (fd_id))
+  {
+    handle_exit(-1);
+  }
+   
+  lock_acquire (&file_lock);
+  int result = file_length (fd_get (fd_id));
+  lock_release (&file_lock);
+  return result;
+}
+\end{verbatim}
+
+Handler \texttt{handle\_filesize} relies on predefined
+\texttt{file\_length}. We also need to validate address or acquire lock in this function. And in this function, we find file with given file descriptor by calling  \texttt{fd\_get} function in \texttt{fd.c}.
+
+\subsection{Page Faults}\label{secpagefault}
+When we meet a real page fault, we have to exit with code -1. So we modified
+it.
+
+\texttt{exception.c}.
+
+\begin{verbatim}
+(in exception.c, page\_fault)
+  if (not_present || (is_kernel_vaddr (fault_addr) && user))
+  {
+    handle_exit(-1);
+  }
+\end{verbatim}
+
+We exit with code -1 when there exists page fault and we also changed some \texttt{thread\_exit} in kill function to \texttt{handle\_exit(-1)}.
+
+In addition, user program must not read kernel data. So we added some code in process loading function.
+
+\begin{verbatim}
+(in process.c, load)
+        case PT_LOAD:
+          if (phdr.p_vaddr < PGSIZE) break;
+\end{verbatim}
+
+This prevents user program to read from kernel data.
+
+\section{Denying writes to Executables}\label{secdeny}
+We have to protect executable files when they are running. So each process remember its own file name and denies write when they are running.
+
+\begin{verbatim}
+(in thread.h, struct thread)
+    struct file *self;
+\end{verbatim}
+
+\begin{verbatim}
+(in process.c, start_process)
+  thread_current ()->self = filesys_open( argv[0] );
+  file_deny_write(thread_current() -> self);
+\end{verbatim}
+
+\texttt{self} is file of thread's executable. When we start process, we call \texttt{file\_deny\_write} function to deny write of that file.
+
+\begin{verbatim}
+(in process.c, process_exit)
+  file_close ( cur->self );
+  cur -> self = NULL;
+\end{verbatim}
+
+When process ends, we close executable and initiate.
+
+\section{Conclusion}\label{secconclusion}
+We implemented argument passing, process management system calls, file
+management system calls, and basic executable write protection. We
+pass all 76 test cases out of 76 test cases.
+
+\end{document}

@@ -1,0 +1,472 @@
+\documentclass[a4paper,article,11pt,oneside]{article}
+\usepackage{fullpage}
+
+\begin{document}
+\title{Report for OS Project \#1 (2011 Fall)\\Team 071}
+\author{Jeehoon Kang\\\texttt{jhkang@ropas.snu.ac.kr}\and Jonghyuk Lee\\\texttt{jonghyuk0605@gmail.com} \and Taekwon Lee\\\texttt{tkwonlee@hotmail.com} }
+\maketitle
+
+This article is structured as follows. Section~\ref{secsleep} presents how to
+make non-busy sleep function. Section~\ref{secpriority}
+presents priority scheduler and section~\ref{secdonate} presents how
+threads donate its priority when synchronous devices such as semaphore
+and mutex are used. Section~\ref{secadv} presents 4.4BSD advanced
+priority scheduler. Section~\ref{secconclusion} concludes.
+
+Note that the Mercurial repository is based at
+\texttt{https://bitbucket.org/lunaticas/os}. Later, we address
+revisions or files whose repository is assumed.
+
+We proudly report that we pass all 27 cases out of 27.
+\begin{verbatim}
+pass tests/threads/alarm-single
+pass tests/threads/alarm-multiple
+... (omitted)
+pass tests/threads/mlfqs-nice-10
+pass tests/threads/mlfqs-block
+All 27 tests passed.
+\end{verbatim}
+
+\section{Non-busy Sleep Function}\label{secsleep}
+Original implementation of \texttt{void
+    timer\_sleep (int64\_t)} is as follows.
+\begin{verbatim}
+void
+timer_sleep (int64_t ticks) 
+{
+  int64_t start = timer_ticks ();
+  ASSERT (intr_get_level () == INTR_ON);
+  while (timer_elapsed (start) < ticks) 
+    thread_yield ();
+}
+\end{verbatim}
+This is called busy-waiting implementation since the thread is not
+excluded from the pool of running threads and get chances to run even
+though it does not perform any significant computation. The goal of
+this section is describe how to implement non-busy sleep.
+
+To achieve this goal, the sleep function should depend on the
+scheduler, since the sleeping threads should be excluded from the pool
+of running threads. For this, we added a new thread status,
+\texttt{THREAD\_SLEEP}.
+\begin{verbatim}
+(in threads/thread.h, enum thread_status)
+     3.4      THREAD_RUNNING,     /* Running thread. */
+     3.5      THREAD_READY,       /* Not running but ready to run. */
+     3.6      THREAD_BLOCKED,     /* Waiting for an event to trigger. */
+     3.7 +    THREAD_SLEEP,       /* Sleeping. */
+     3.8      THREAD_DYING        /* About to be destroyed. */
+     3.9    };
+\end{verbatim}
+When \texttt{void timer\_sleep (int64\_t)} is called, it calles
+\texttt{void thread\_sleep (int64\_t)} in \texttt{thread.h}.
+\begin{verbatim}
+(in devices/timer.c)
+     1.4  void
+     1.5  timer_sleep (int64_t ticks) 
+     1.6  {
+     1.7 -  int64_t start = timer_ticks ();
+     1.8 +  int64_t sleep_until = timer_ticks () + ticks;
+     1.9  
+    1.10    ASSERT (intr_get_level () == INTR_ON);
+    1.11 -  while (timer_elapsed (start) < ticks) 
+    1.12 -    thread_yield ();
+    1.13 +  thread_sleep (sleep_until);
+    1.14  }
+\end{verbatim}
+The role of \texttt{void thread\_sleep (int64\_t)} is exclude the
+current thread from the pool of running threads,
+i.e. \texttt{ready\_list}. The current thread is moved to
+\texttt{sleep\_list}.
+Every once a tick, \texttt{sleep\_list} is checked and threads which
+should be awaken are moved to \texttt{ready\_list}, in the order of 1)
+awakening time and 2) priority.
+\begin{verbatim}
+(in threads/thread.c, void thread_tick (void))
+    2.82 +  /* Awake sleeping processes. */
+    2.83 +  struct list_elem *e;
+    2.84 +  struct thread *t;
+    2.85 +  int64_t ticks = timer_ticks ();
+    2.86 +
+    2.87 +  while (!list_empty (&sleep_list))
+    2.88 +  {
+    2.89 +    e = list_min (&sleep_list, thread_sleep_less_func, NULL);
+    2.90 +    t = list_entry (e, struct thread, elem);
+    2.91 +
+    2.92 +    if (t->sleep_until <= ticks)
+    2.93 +    {
+    2.94 +      t->status = THREAD_READY;
+    2.95 +      list_remove (e);
+    2.96 +      list_push_back (&ready_list, e);
+    2.97 +    }
+    2.98 +    else
+    2.99 +    {
+   2.100 +      break;
+   2.101 +    }
+   2.102 +  }
+\end{verbatim}
+
+To sum up, thanks to the update on the schuduler, the timer can
+implement non-busy sleep function.
+
+See revision 14.
+
+\section{Priority Scheduler}\label{secpriority}
+
+The basic behavior of priority scheduler is simple: the scheduler
+always pick up the ready thread of the highest priority.
+\begin{verbatim}
+(in threads/thread.c, next_thread_to_run)
+    1.88 -    return list_entry (list_pop_front (&ready_list), struct thread, elem);
+    1.89 +  {
+    1.90 +    struct list_elem *e = list_max (&ready_list,
+    1.91 +                                    thread_priority_less_func,
+    1.92 +                                    NULL);
+    1.93 +    struct thread *t = list_entry (e, struct thread, elem);
+    1.94 +    return t;
+    1.95 +  }
+    1.96  }
+\end{verbatim}
+
+However, to ensure that always the thread of the highest priority is
+running, we have to consider three more cases: 1) thread creation, 2)
+setting the priority of thread, 3) two or more threads are
+simultaenuously waken up from sleep, and 4) two or more threads can be
+unblocked from the same semaphore, lock, or conditional variable.
+
+When the newly created thread has a higher priority than the current
+one, the current thread immediately yields.
+\begin{verbatim}
+(in threads/thread.c, thread_create)
+    1.22 +  if (thread_current ()->priority < priority)
+    1.23 +  {
+    1.24 +    thread_yield ();
+    1.25 +  }
+    1.26 +
+\end{verbatim}
+
+Setting the priority of the current thread may yield if the new
+priority is not high enough.
+\begin{verbatim}
+(in threads/thread.c, thread_set_priority)
+    1.59  void
+    1.60  thread_set_priority (int new_priority) 
+    1.61  {
+    1.62 -  thread_current ()->priority = new_priority;
+    1.63 +  struct thread *cur = thread_current ();
+    1.64 +  int old_priority = cur->priority;
+    1.65 +  enum intr_level old_level;
+    1.66 +  
+    1.67 +  ASSERT (!intr_context ());
+    1.68 +
+    1.69 +  old_level = intr_disable ();
+    1.70 +  cur->priority = new_priority;
+    1.71 +  if (new_priority < old_priority && !list_empty (&ready_list))
+    1.72 +  {
+    2.27 +    thread_yield ();
+    1.79 +  }
+    1.80 +  intr_set_level (old_level);  
+    1.81  }
+\end{verbatim}
+
+When a thread is awaken, the current thread yields to ensure that the
+thread of the highest priority is running. Also, when two threads wake
+up at the same time, the one with a higher priority goes first.
+\begin{verbatim}
+(in threads/thread.c, thread_tick)
+     1.4        t->status = THREAD_READY;
+     1.5        list_remove (e);
+     1.6        list_push_back (&ready_list, e);
+     1.7 +      intr_yield_on_return ();
+(in threads/thread.c, thread_sleep_less_func)
+    1.36 -  return ta->sleep_until < tb->sleep_until;
+    1.37 +  return (ta->sleep_until < tb->sleep_until) ||
+    1.38 +      (ta->sleep_until == tb->sleep_until &&
+    1.39 +       ta->priority > tb->priority);
+\end{verbatim}
+
+When a semaphore is up, the threads of the highest priority waiting
+for the semaphore should wake up. Similarly for conditional variables,
+too.
+
+See revision 15, 19, 21, and 23.
+
+\section{Priority Donation}\label{secdonate}
+
+To implement priority donation, we have to make chains of locks and
+donate priority through them. For semaphore and condition variable,
+when they are released, the next thread to hold them is the one who
+has the highest priority.
+
+Threads have their own list of locks. Member \texttt{elem} of
+\texttt{struck lock} and \texttt{waits\_for} of \texttt{struct thread}
+are for it. Each lock has its highest priority in the lock chain it
+belongs to. See \texttt{highest\_priority} of \texttt{struct lock}.
+
+Since the priority of threads may changes according to donation, we
+have to remember the explicitly set original priority. Member
+\texttt{old\_priority} is for it.
+
+\begin{verbatim}
+(in threads/synch.h, struct lock)
+     2.8 +    struct list_elem elem;      /* List element. */
+     2.9 +    int highest_priority;       /* Highest priority of waiters. */
+(in threads/thread.h, struct thread)
+     4.6      int priority;                       /* Priority. */
+     4.7 +    int old_priority;                   /* Base priority. */
+    4.15 +    struct list locks;                  /* List of acquired locks. */
+    4.16 +    struct lock *waits_for;             /* Lock waiting for acquire. */
+\end{verbatim}
+
+The initial value of \texttt{highest\_priority} of a lock is the
+minimum priority. When the current thread wants to acquire a lock, it
+donates the priority of the it to all the threads in the lock chain
+whenever it is advantageous for them.
+
+\begin{verbatim}
+(in threads/synch.c, lock_init)
+    1.25 +  lock->highest_priority = PRI_MIN;
+(in threads/synch.c, lock_acquire)
+  if(!thread_mlfqs)
+  {
+    enum intr_level old_level;
+
+    old_level = intr_disable ();
+
+      cur->waits_for = lock;
+
+      struct lock *l;
+      for (l = lock; l != NULL; l = l->holder->waits_for)
+      {
+        if (l->holder == NULL || l->highest_priority >= cur->priority) break;
+        l->highest_priority = cur->priority;
+        if (l->holder->priority < cur->priority) l->holder->priority = cur->priority;
+      }
+    intr_set_level (old_level);
+  }
+
+  sema_down (&lock->semaphore);
+  lock->holder = cur;
+
+  if(!thread_mlfqs)
+  {
+      cur->waits_for = NULL;
+      list_push_back (&cur->locks, &lock->elem);
+  }
+\end{verbatim}
+
+When the current thread releases a lock, the priority of current
+thread is restored to the original priority before donation. 
+
+\begin{verbatim}
+(in threads/synch.c, lock_release)
+    1.70    lock->holder = NULL;
+    1.71 +  if(!thread_mlfqs)
+    1.72 +  {
+    1.73 +    lock->highest_priority = PRI_MIN;
+    1.74 +    list_remove (&lock->elem);
+    1.75 +  }
+    1.76    sema_up (&lock->semaphore);
+    1.77 +  if(!thread_mlfqs) thread_set_priority (thread_current ()->old_priority);
+\end{verbatim}
+
+In \texttt{set\_priority} of \texttt{thread.c}, with priority
+donation, we have to consider priorities of locks acquired by the
+current thread. So we find highest priority among acquired locks and
+if it is greater than \texttt{new\_priority} then it becomes current
+priority. Note that \texttt{old\_priority} has priority without
+donation.
+
+\begin{verbatim}
+(in threads/thread.c, set_priority)
+    3.46 +  enum intr_level old_level;
+    3.47 +
+    3.48 +  old_level = intr_disable ();
+    3.49 +
+    3.50    struct thread *cur = thread_current ();
+    3.51    int old_priority = cur->priority;
+    3.52 -  enum intr_level old_level;
+    3.53  
+    3.54 -  ASSERT (!intr_context ());
+    3.55 +  cur->old_priority = new_priority;
+    3.56  
+    3.57 -  old_level = intr_disable ();
+    3.58 +  struct list_elem *e;
+    3.59 +  struct lock *t;
+    3.60 +  for (e = list_begin (&cur->locks);
+                 e != list_end (&cur->locks);
+                 e = list_next (e))
+    3.61 +  {
+    3.62 +    t = list_entry (e, struct lock, elem);
+    3.63 +    if (new_priority < t->highest_priority)
+                new_priority = t->highest_priority;
+    3.64 +  }
+    3.65 +
+    3.66    cur->priority = new_priority;
+    3.67 -  if (cur->priority < old_priority && !list_empty (&ready_list))
+    3.68 -  {
+    3.69 +
+    3.70 +  intr_set_level (old_level);
+    3.71 +
+    3.72 +  if (new_priority < old_priority)
+    3.73      thread_yield ();
+    3.74 -  }
+    3.75 -  intr_set_level (old_level);
+\end{verbatim}
+
+See revision 21.
+
+\section{4.4BSD Advanced Scheduler}\label{secadv}
+The algorithm for this scheduler is presented in the Pintos
+documentation, so we do not repeat it. This feature is activaated only
+when \texttt{thread\_mlfqs} in \texttt{threads/thread.c} is true.
+
+\subsection{Fixed Point Real Number Library}
+We added a fixed point real number library in
+\texttt{lib/kernel/real.[c,h]}. The description of structures and
+functions are as follows.
+\begin{itemize}
+\item \texttt{struct real}\\
+This structure is for a fixed point real number. As Pintos
+documentation said, 17 bits for integer parts, 14 bits for fractional
+parts, and 1 bit for sign constitute 32 bits of the integer.
+\begin{verbatim}
+(in lib/kernel/real.h)
+struct real
+{
+  int bits;
+}
+\end{verbatim}
+
+\item \texttt{struct real real\_of\_int (int)}\\
+It returns the real number equivalent to the input integer number.
+
+\item \texttt{int int\_of\_real (struct real)}\\
+It returns the integer number equivalent to the input real number.
+
+\item \texttt{struct real real\_add, real\_sub, real\_mult, real\_div
+    (struct real, struct real)}\\
+They are addition, subtraction, multiplication, and division for real
+numbers.
+
+\item \texttt{struct real real\_minus (struct real)}\\
+This is the unary minus operator for real numbers.
+
+\item \texttt{bool real\_less\_func (struct real, struct real)}\\
+This is the comparison function for real numbers.
+
+\end{itemize}
+
+See revision 16 and 17.
+
+\subsection{Niceness}
+Niceness is added to a thread structure.
+\begin{verbatim}
+(in threads/thread.h, struct thread)
+    6.24      char name[16];                      /* Name (for debugging purposes). */
+    6.25      uint8_t *stack;                     /* Saved stack pointer. */
+    6.26      int priority;                       /* Priority. */
+    6.27 +    int nice;                           /* Niceness. */
+\end{verbatim}
+Now \texttt{init\_thread} accepts the niceness of the thread to be initialized.
+\begin{verbatim}
+(in threads/thread.c)
+   5.269 -init_thread (struct thread *t, const char *name, int priority)
+   5.270 +init_thread (struct thread *t, const char *name, int priority, int nice)
+\end{verbatim}
+With the above change, \texttt{thread\_create} passes the niceness of
+the current thread to \texttt{init\_thread}.
+\begin{verbatim}
+(in threads/thread.c, thread_create)
+   5.119 -  init_thread (t, name, priority);
+   5.120 +  init_thread (t, name, priority, thread_current ()->nice);
+\end{verbatim}
+
+Setting the niceness of the current thread reschedule if necessary.
+\begin{verbatim}
+(in threads/thread.c, thread_set_nice)
+    2.32    calculate_priority (thread_current (), NULL);
+    2.33    if (cur->priority < old_priority && !list_empty (&ready_list))
+    2.34    {
+    2.41 +    thread_yield ();
+    2.42    }
+\end{verbatim}
+
+See revision 16, 18, and 19.
+
+\subsection{Average Load and Recent CPU}
+The global variable \texttt{load\_avg} in \texttt{threads/thread.c} and
+\texttt{recent\_cpu} of \texttt{struct thread} in
+\texttt{threads/thread.h} is newly defined as real number.
+\begin{verbatim}
+(in threads/thread.c)
+    5.15 +static struct real load_avg;
+(in threads/thread.h, struct thread)
+    6.28 +    struct real recent_cpu;             /* Recent CPU. */
+    6.29      int64_t sleep_until;                /* For timer_sleep. */
+    6.30      struct list_elem allelem;           /* List element for all threads list. */
+\end{verbatim}
+
+Every once a tick, \texttt{recent\_cpu} of the current thread is
+added.
+\begin{verbatim}
+(in threads/thread.c, thread_tick)
+    5.88 +    if (thread_current != idle_thread)
+    5.89 +    {
+    5.90 +      thread_current ()->recent_cpu = real_add (thread_current ()->recent_cpu,
+    5.91 +                                                real_of_int (1));
+    5.92 +    }
+\end{verbatim}
+
+Every once a second, \texttt{load\_avg} and \texttt{recent\_cpu} of each
+thread is recalculated.
+\begin{verbatim}
+(in threads/thread.c, thread_tick)
+    5.94 +    if (ticks % TIMER_FREQ == 0)
+    5.95 +    {
+    5.96 +      int ready_thread = list_size (&ready_list) + (thread_current () == idle_thread ? 0 : 1);
+    5.97 +      load_avg = real_div (real_add (real_mult (real_of_int (59),
+    5.98 +                                                load_avg),
+    5.99 +                                     real_of_int (ready_thread)),
+   5.100 +                           real_of_int (60));
+   5.101 +      thread_foreach (calculate_recent_cpu,
+   5.102 +                      NULL);
+   5.103 +    }
+\end{verbatim}
+
+See revision 16.
+
+\subsection{Priority}
+Every once per 4 ticks, the priority of each thread is recalculated.
+\begin{verbatim}
+(in threads/thread.c, thread_tick)
+   5.104 +    if (ticks % 4 == 0)
+   5.105 +    {
+   5.106 +      thread_foreach (calculate_priority,
+   5.107 +                      NULL);
+    1.16 +      if (!list_empty (&ready_list))
+    1.17 +      {
+    1.18 +        struct thread *t = next_thread_to_run ();
+    1.19 +        if (thread_priority_less_func (&(cur->elem),
+    1.20 +                                       &(t->elem),
+    1.21 +                                       NULL)) {
+    1.22 +          intr_yield_on_return ();
+    1.23 +        }            
+    1.24 +      }
+   5.108 +    }
+\end{verbatim}
+
+See revision 16 and 18.
+
+To sum up, priority of each thread is recalculated automatically with
+recent CPU utilization and niceness of each thread, average load of
+the CPU, etc. Updating the niceness reschedules if
+necessary. Automation is due to \texttt{thread\_ticks}.
+
+See revision 16, 17, 18, and 19.
+
+\section{Conclusion}\label{secconclusion}
+We made a non-busy sleep function, priority scheduler with donation,
+and 4.4BSD advanced scheduler. We pass all test cases.
+
+\end{document}
